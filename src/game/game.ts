@@ -12,6 +12,8 @@ import { Human, LOOKS, defaultState, type HumanState, type Look } from './humano
 import { MISSIONS, MissionFail, setupStory } from './story';
 import { hud, emitHud } from './store';
 import { Sky } from './sky';
+import { Interiors } from './interiors';
+import { Hustle } from './hustle';
 import { Vehicle, noControl } from './vehicle';
 import { WEAPONS, WEAPON_ORDER, buildWeaponModel, type WeaponDef, type WeaponId, type WeaponModel } from './weapons';
 import { HALF, World, nodePos, type Hit } from './world';
@@ -25,14 +27,14 @@ interface Waiter { cond: () => boolean; resolve: () => void; reject: (e: unknown
 export interface RayHit { t: number; kind: 'none' | 'world' | 'ground' | 'npc' | 'vehicle'; npc?: Npc; veh?: Vehicle; head?: boolean; nx: number; ny: number; nz: number }
 
 const GRADE = {
-  uniforms: { tDiffuse: { value: null as THREE.Texture | null }, uTime: { value: 0 }, uVig: { value: 1.0 }, uDamage: { value: 0 }, uSpeed: { value: 0 }, uSat: { value: 1.08 }, uAim: { value: 0 } },
+  uniforms: { tDiffuse: { value: null as THREE.Texture | null }, uTime: { value: 0 }, uVig: { value: 1.0 }, uDamage: { value: 0 }, uSpeed: { value: 0 }, uSat: { value: 1.0 }, uAim: { value: 0 } },
   vertexShader: 'varying vec2 vUv; void main(){ vUv = uv; gl_Position = projectionMatrix * modelViewMatrix * vec4(position,1.0); }',
   fragmentShader: /* glsl */ `
   uniform sampler2D tDiffuse; uniform float uTime, uVig, uDamage, uSpeed, uSat, uAim; varying vec2 vUv;
   float h(vec2 p){ return fract(sin(dot(p, vec2(12.9898,78.233))) * 43758.5453); }
   void main(){
     vec2 c = vUv - 0.5; float r = dot(c,c);
-    float ca = 0.0008 + r * 0.006 + uSpeed * 0.004;
+    float ca = 0.0003 + r * 0.0018 + uSpeed * 0.003;
     vec3 col = vec3(texture2D(tDiffuse, vUv + c*ca).r, texture2D(tDiffuse, vUv).g, texture2D(tDiffuse, vUv - c*ca).b);
     if (uSpeed > 0.02) { vec3 acc = col; for (int i=1;i<6;i++){ acc += texture2D(tDiffuse, vUv - c * float(i) * 0.012 * uSpeed).rgb; } col = mix(col, acc/6.0, clamp(r*3.0,0.0,1.0)*uSpeed); }
     col *= 1.0 - r * uVig * (1.0 + uAim*0.5);
@@ -41,7 +43,7 @@ const GRADE = {
     col = mix(vec3(l), col, uSat);
     vec3 shadowT = vec3(0.92,1.0,1.1), highT = vec3(1.06,1.0,0.92);
     col *= mix(shadowT, highT, smoothstep(0.1, 0.9, l));
-    col += (h(vUv*vec2(1920.0,1080.0) + uTime) - 0.5) * 0.02;
+    col += (h(vUv*vec2(1920.0,1080.0) + uTime) - 0.5) * 0.009;
     gl_FragColor = vec4(col, 1.0);
   }`,
 };
@@ -61,6 +63,8 @@ export class Game {
   sky!: Sky;
   fx!: FX;
   world!: World;
+  interiors!: Interiors;
+  hustle!: Hustle;
   audio = new AudioEngine();
   crowd!: Crowd;
   traffic!: Traffic;
@@ -77,7 +81,7 @@ export class Game {
   // player
   playerHuman!: Human;
   playerHs: HumanState = defaultState();
-  player = { x: 0, y: 0, z: 0, vy: 0, heading: 0, vx: 0, vz: 0, hp: 100, armor: 0, cash: 800, vehicle: null as Vehicle | null, crouch: false, onGround: true, aim: false };
+  player = { x: 0, y: 0, z: 0, vy: 0, heading: 0, vx: 0, vz: 0, hp: 100, armor: 0, cash: 800, vehicle: null as Vehicle | null, crouch: false, onGround: true, aim: false, block: false };
   inv: Record<string, { have: boolean; mag: number; reserve: number }> = {};
   weapon: WeaponId = 'pistol';
   wm: WeaponModel | null = null;
@@ -123,6 +127,10 @@ export class Game {
   toastId = 1;
   interact: { kind: 'npc' | 'poi' | 'veh' | 'none'; npc?: Npc; poi?: string; veh?: Vehicle } = { kind: 'none' };
   respawnT = 0;
+  combo = 0; comboT = 9; swingStage = 0; meleeFace: number | null = null; lungeT = 0; lungeV = { x: 0, z: 0 };
+  blockT = 0; dodgeT = 0; dodgeCd = 0; dodgeV = { x: 0, z: 0 }; perfectT = -9;
+  hitStop = 0; bulletT = 0; floaterId = 1;
+  killCtx = { head: false, melee: false };
   stepAcc = 0;
   distAcc = 0;
   carryOver = 0;
@@ -155,6 +163,7 @@ export class Game {
     await tick();
     this.world = new World();
     this.scene.add(this.world.group);
+    this.interiors = new Interiors(this);
     this.buildMap();
     progress('Painting facades & windows…', 0.4);
     await tick();
@@ -169,6 +178,7 @@ export class Game {
     this.crowd = new Crowd(this);
     this.traffic = new Traffic(this);
     this.police = new Police(this);
+    this.hustle = new Hustle(this);
     progress('Building story & characters…', 0.6);
     await tick();
     this.story = setupStory(this);
@@ -229,6 +239,7 @@ export class Game {
     hud.phase = 'menu';
     this.state = 'menu';
     this.refreshMissionList();
+    this.hustle.sync(false);
     emitHud();
     this.last = performance.now();
     this.raf = requestAnimationFrame(this.frame);
@@ -243,7 +254,7 @@ export class Game {
     const rt = new THREE.WebGLRenderTarget(size.x, size.y, { type: THREE.HalfFloatType, samples: 4 });
     this.composer = new EffectComposer(this.renderer, rt);
     this.composer.addPass(new RenderPass(this.scene, this.camera));
-    this.bloom = new UnrealBloomPass(new THREE.Vector2(size.x, size.y), 0.42, 0.7, 0.92);
+    this.bloom = new UnrealBloomPass(new THREE.Vector2(size.x, size.y), 0.3, 0.6, 1.15);
     this.composer.addPass(this.bloom);
     this.grade = new ShaderPass(GRADE);
     this.composer.addPass(this.grade);
@@ -416,10 +427,13 @@ export class Game {
     if (this.disposed) return;
     this.raf = requestAnimationFrame(this.frame);
     let dt = Math.min(0.05, (now - this.last) / 1000);
+    const rawDt = dt;
     this.last = now;
     this.fpsAcc += dt; this.fpsN++;
     if (this.fpsAcc > 0.5) { hud.fps = Math.round(this.fpsN / this.fpsAcc); this.fpsAcc = 0; this.fpsN = 0; }
     if (!this.paused) {
+      if (this.hitStop > 0) { this.hitStop -= rawDt; dt *= 0.1; }
+      if (this.bulletT > 0) { this.bulletT -= rawDt; this.slowmo = 0.4; if (this.bulletT <= 0 && this.state === 'play') this.slowmo = 1; }
       dt *= this.slowmo;
       this.update(dt);
     }
@@ -435,7 +449,7 @@ export class Game {
     this.grade.uniforms.uDamage.value = clamp(hud.damage, 0, 1) + (this.player.hp < 30 ? (30 - this.player.hp) / 60 : 0);
     this.grade.uniforms.uAim.value = hud.aiming ? 1 : 0;
     this.bloom.enabled = hud.settings.bloom;
-    this.bloom.strength = 0.28 + this.sky.night * 0.5;
+    this.bloom.strength = 0.12 + this.sky.night * 0.22;
     this.composer.render(dt);
   }
 
@@ -446,9 +460,11 @@ export class Game {
     if (this.state === 'menu') this.updateMenu(dt);
     else this.updatePlayer(dt);
     this.updateWorld(dt, night);
+    this.hustle.update(dt);
     this.updateCamera(dt);
     this.sky.update(dt, hud.phase === 'playing' ? hud.settings.timeScale * 6 : 2, this.focus(), this.camera);
     this.world.update(dt, this.time, this.focus(), this.sky.night);
+    this.interiors.update(dt);
     this.fx.update(dt, this.renderer.domElement.height * 0.5);
     this.updateAudio(dt);
     this.updateWaiters();
@@ -497,8 +513,13 @@ export class Game {
       if (Math.abs(this.mouseDx) + Math.abs(this.mouseDy) > 0) this.camLookT = 2.2;
     }
     this.camLookT -= dt;
-    p.aim = this.rmb && !p.vehicle && this.state === 'play' && !inDialogue;
-    hud.aiming = p.aim;
+    const wcls = WEAPONS[this.weapon].cls;
+    const meleeW = wcls === 'none' || wcls === 'melee';
+    p.aim = this.rmb && !p.vehicle && this.state === 'play' && !inDialogue && !meleeW && !this.interiors.current;
+    p.block = this.rmb && !p.vehicle && this.state === 'play' && !inDialogue && meleeW && !this.interiors.current && this.dodgeT <= 0;
+    this.blockT = p.block ? this.blockT + dt : 0;
+    hud.aiming = p.aim; hud.blocking = p.block;
+    hud.dodgeCd = this.dodgeCd; hud.combo = this.comboT < 1.1 ? this.combo : 0;
 
     if (this.state === 'dead' || this.state === 'busted') {
       this.respawnT -= dt;
@@ -519,6 +540,7 @@ export class Game {
     if (p.vehicle) this.updateDriving(dt);
     else this.updateOnFoot(dt);
     this.updateWeapons(dt);
+    this.updateTargeting();
     // pickups
     for (let i = this.pickups.length - 1; i >= 0; i--) {
       const c = this.pickups[i];
@@ -544,19 +566,41 @@ export class Game {
     let dx = cf.x * iz + cr.x * ix, dz = cf.z * iz + cr.z * ix;
     const l = Math.hypot(dx, dz);
     if (l > 0) { dx /= l; dz /= l; }
-    const base = p.crouch ? 1.6 : p.aim ? 2.4 : sprint ? 6.4 : 3.4;
+    const base = p.crouch ? 1.6 : p.aim ? 2.4 : p.block ? 1.9 : sprint ? 6.4 : 3.4;
     const spd = l > 0 ? base : 0;
     const k = p.onGround ? 11 : 2.5;
-    p.vx = damp(p.vx, dx * spd, k, dt);
-    p.vz = damp(p.vz, dz * spd, k, dt);
+    // dodge roll [Q]
+    this.dodgeCd = Math.max(0, this.dodgeCd - dt);
+    if (this.pressed('KeyQ') && !inDialogue && this.dodgeCd <= 0 && p.onGround && !this.interiors.current && this.dodgeT <= 0) {
+      const ex = l > 0 ? dx : -cf.x, ez = l > 0 ? dz : -cf.z;
+      this.dodgeT = 0.5; this.dodgeCd = 0.9;
+      this.dodgeV = { x: ex * 9.5, z: ez * 9.5 };
+      p.heading = Math.atan2(ex, ez);
+      this.audio.swing();
+      this.fx.dust(p.x, p.y + 0.1, p.z, 0, 0, 3);
+    }
+    if (this.dodgeT > 0) {
+      this.dodgeT -= dt;
+      const kk = 0.35 + 0.65 * Math.max(0, this.dodgeT / 0.5);
+      p.vx = this.dodgeV.x * kk; p.vz = this.dodgeV.z * kk;
+    } else if (this.lungeT > 0) {
+      this.lungeT -= dt;
+      p.vx = this.lungeV.x; p.vz = this.lungeV.z;
+    } else {
+      p.vx = damp(p.vx, dx * spd, k, dt);
+      p.vz = damp(p.vz, dz * spd, k, dt);
+    }
     // facing
     const shooting = this.mouseDown && WEAPONS[this.weapon].cls !== 'none' && WEAPONS[this.weapon].cls !== 'melee';
-    if (p.aim || shooting || this.meleeT > 0) p.heading = dampAngle(p.heading, this.camYaw, 16, dt);
+    if (this.dodgeT > 0) { /* keep roll direction */ }
+    else if (this.meleeT > 0 && this.meleeFace !== null) p.heading = dampAngle(p.heading, this.meleeFace, 22, dt);
+    else if (p.aim || shooting || this.meleeT > 0 || p.block) p.heading = dampAngle(p.heading, this.camYaw, 16, dt);
     else if (l > 0.1) p.heading = dampAngle(p.heading, Math.atan2(dx, dz), 12, dt);
     // jump
-    if (this.pressed('Space') && p.onGround && !inDialogue && !p.crouch) { p.vy = 5.6; p.onGround = false; }
+    if (this.pressed('Space') && p.onGround && !inDialogue && !p.crouch && this.dodgeT <= 0) { p.vy = 5.6; p.onGround = false; }
     p.x += p.vx * dt; p.z += p.vz * dt;
-    const gy = this.world.groundY(p.x, p.z);
+    const inside = !!this.interiors.current;
+    const gy = inside ? 0 : this.world.groundY(p.x, p.z);
     if (!p.onGround || p.y > gy + 0.05) {
       p.vy -= 17 * dt;
       p.y += p.vy * dt;
@@ -566,7 +610,8 @@ export class Game {
       p.y = damp(p.y, gy, 18, dt);
     }
     const hit = this.tmpHit;
-    if (this.world.resolve(p.x, p.z, 0.34, hit, p.y) && hit.hit) { p.x = hit.x; p.z = hit.z; }
+    if (inside) { const q = this.interiors.resolve(p.x, p.z, 0.34); p.x = q.x; p.z = q.z; }
+    else if (this.world.resolve(p.x, p.z, 0.34, hit, p.y) && hit.hit) { p.x = hit.x; p.z = hit.z; }
     // push by vehicles (stand clear!)
     for (const v of this.vehicles) {
       if (Math.abs(v.speed) < 2 || Math.abs(v.x - p.x) > 6 || Math.abs(v.z - p.z) > 6) continue;
@@ -594,6 +639,12 @@ export class Game {
     h.root.position.set(p.x, p.y, p.z);
     h.root.rotation.y = p.heading;
     h.update(dt, hs);
+    if (this.dodgeT > 0) {
+      const th = (1 - this.dodgeT / 0.5) * Math.PI * 2;
+      h.root.rotation.x = th;
+      const off = -0.85 * Math.sin(th), dy = 0.85 - 0.85 * Math.cos(th);
+      h.root.position.x += Math.sin(p.heading) * off; h.root.position.z += Math.cos(p.heading) * off; h.root.position.y += dy;
+    } else if (h.root.rotation.x !== 0 && !h.dead) h.root.rotation.x = 0;
     this.distAcc += Math.hypot(p.vx, p.vz) * dt;
   }
 
@@ -651,6 +702,12 @@ export class Game {
     this.interact = { kind: 'none' };
     let prompt: string | null = null;
     if (hud.dialogue || this.state !== 'play' || hud.shop) { hud.prompt = null; return; }
+    if (this.interiors.current) {
+      const ia = this.interiors.interactAt(p.x, p.z);
+      hud.prompt = ia ? ia.prompt : null;
+      this.interact = ia ? { kind: 'poi', poi: ia.kind === 'exit' ? '__exit' : this.interiors.current.id } : { kind: 'none' };
+      return;
+    }
     if (!p.vehicle) {
       let best = 3.2;
       for (const n of this.npcs) {
@@ -660,10 +717,10 @@ export class Game {
       }
       if (this.interact.kind === 'none') {
         for (const poi of this.world.pois) {
-          if (!['shop', 'service', 'home'].includes(poi.kind) || poi.r < 2) continue;
+          if (!['shop', 'service', 'home'].includes(poi.kind) || poi.r < 2 || !this.interiors.supports(poi.id)) continue;
           if (Math.hypot(poi.x - p.x, poi.z - p.z) < poi.r) {
             this.interact = { kind: 'poi', poi: poi.id };
-            prompt = poi.kind === 'home' ? 'Enter Safehouse' : `Enter ${poi.name}`;
+            prompt = poi.kind === 'home' ? 'Enter Safehouse' : `Walk into ${poi.name}`;
             break;
           }
         }
@@ -696,7 +753,12 @@ export class Game {
   private doInteract() {
     const it = this.interact;
     if (it.kind === 'npc' && it.npc) this.story?.talk(it.npc.key);
-    else if (it.kind === 'poi' && it.poi) this.openPoi(it.poi);
+    else if (it.kind === 'poi' && it.poi) {
+      if (it.poi === '__exit') this.interiors.exit();
+      else if (this.interiors.current) this.openPoi(it.poi);
+      else if (this.player.vehicle || !this.interiors.supports(it.poi)) this.openPoi(it.poi);
+      else this.interiors.enter(it.poi);
+    }
     else if (it.kind === 'veh' && it.veh) {
       if (this.player.vehicle) this.exitVehicle();
       else this.enterVehicle(it.veh);
@@ -830,7 +892,7 @@ export class Game {
     else if (itemId === 'burger') { pay(); this.player.hp = Math.min(100, this.player.hp + 40); }
     else if (itemId === 'burger2' || itemId === 'heal') { pay(); this.player.hp = 100; this.toast('Health', 'Fully restored', 'good'); }
     else if (itemId === 'repair') { if (!car) return; pay(); car.repair(); this.toast('Garage', 'Car fully repaired', 'good'); }
-    else if (itemId.startsWith('paint:')) { if (!car) return; pay(); car.setColor(parseInt(itemId.slice(6))); this.toast('Garage', 'Fresh paint job', 'good'); }
+    else if (itemId.startsWith('paint:')) { if (!car) return; pay(); car.setColor(parseInt(itemId.slice(6))); this.interiors.recolor(parseInt(itemId.slice(6))); this.toast('Garage', 'Fresh paint job', 'good'); }
     else if (itemId === 'nitro') { if (!car) return; pay(); car.nitro = 1; }
     else if (itemId === 'spraywash') {
       if (!car) { this.toast('Pay\'n\'Spray', 'Drive in with a car first', 'bad'); return; }
@@ -852,9 +914,16 @@ export class Game {
     emitHud();
   }
 
+  addCashQuiet(n: number) {
+    this.player.cash += n;
+    hud.cash = this.player.cash;
+    if (n > 0) this.hustle.progress('cash', n);
+    emitHud();
+  }
   addCash(n: number) {
     this.player.cash += n;
     hud.cash = this.player.cash;
+    if (n > 0) this.hustle.progress('cash', n);
     if (n >= 50) this.toast(n > 0 ? `+${fmtMoney(n)}` : fmtMoney(n), '', 'cash');
   }
 
@@ -875,21 +944,29 @@ export class Game {
       const m = this.wm.flash.material as THREE.MeshBasicMaterial;
       m.opacity = Math.max(0, m.opacity - dt * 22);
     }
-    if (p.vehicle || this.state !== 'play' || hud.dialogue || hud.shop) return;
+    if (p.vehicle || this.state !== 'play' || hud.dialogue || hud.shop || this.interiors.current) return;
     if (this.pressed('KeyR') && def.mag > 0 && inv.mag < def.mag && inv.reserve > 0 && this.reloadT <= 0) {
-      this.reloadT = def.reload;
+      this.reloadT = def.reload * this.hustle.reloadMul;
       this.audio.reload();
       this.updateWeaponHud();
     }
     // melee
     if (def.cls === 'none' || def.cls === 'melee') {
+      this.comboT += dt;
       if (this.meleeT > 0) {
         this.meleeT -= dt;
-        if (!this.meleeHit && this.meleeT < 0.2) { this.meleeHit = true; this.doMelee(def); }
+        if (!this.meleeHit && this.meleeT < (this.swingStage === 2 ? 0.24 : 0.2)) { this.meleeHit = true; this.doMelee(def, this.swingStage); }
+        if (this.meleeT <= 0) this.meleeFace = null;
       }
-      if (this.mouseDown && this.fireT <= 0 && document.pointerLockElement === this.canvas) {
-        this.fireT = 1 / def.rate;
-        this.meleeT = 0.34; this.meleeHit = false;
+      if (this.mouseDown && this.fireT <= 0 && !p.block && this.dodgeT <= 0 && document.pointerLockElement === this.canvas) {
+        if (this.comboT > 1.1) this.combo = 0;
+        this.swingStage = this.combo % 3;
+        this.combo++;
+        this.comboT = 0;
+        const slow = def.id === 'bat' ? 1.3 : 1;
+        this.fireT = (this.swingStage === 2 ? 0.7 : 0.27) * slow;
+        this.meleeT = this.swingStage === 2 ? 0.44 : 0.34; this.meleeHit = false;
+        this.lunge();
         this.playerHuman.punch();
         this.audio.swing();
       }
@@ -901,7 +978,7 @@ export class Game {
     if (inv.mag <= 0) {
       this.audio.empty();
       this.fireT = 0.3;
-      if (inv.reserve > 0) { this.reloadT = def.reload; this.audio.reload(); this.updateWeaponHud(); }
+      if (inv.reserve > 0) { this.reloadT = def.reload * this.hustle.reloadMul; this.audio.reload(); this.updateWeaponHud(); }
       return;
     }
     this.fireT = 1 / def.rate;
@@ -924,6 +1001,8 @@ export class Game {
     const camPos = this.camera.position.clone();
     const first = this.castRay(camPos.x, camPos.y, camPos.z, camDir.x, camDir.y, camDir.z, def.range + 20, { skipPlayer: true });
     const aimPt = first.kind === 'none' ? camPos.clone().addScaledVector(camDir, 80) : camPos.clone().addScaledVector(camDir, first.t);
+    const assist = this.assistTarget(camPos, camDir, def, p.aim ? 0.075 : 0.035);
+    if (assist) aimPt.copy(assist);
     const muz = new THREE.Vector3();
     if (this.wm) { this.wm.muzzle.updateWorldMatrix(true, false); this.wm.muzzle.getWorldPosition(muz); this.wm.flash.material instanceof THREE.MeshBasicMaterial && (this.wm.flash.material.opacity = 1); this.wm.flash.rotation.z = Math.random() * 6; }
     else muz.set(p.x, p.y + 1.4, p.z);
@@ -949,9 +1028,17 @@ export class Game {
     if (def.pellets === 1 || Math.random() < 0.3) this.fx.tracer(origin.clone().addScaledVector(dir, 1.5), end);
     const n = new THREE.Vector3(r.nx, r.ny, r.nz);
     if (r.kind === 'npc' && r.npc) {
-      const killed = r.npc.hurt(def.dmg, this, origin.x, origin.z, !!r.head, from === 'player', 0);
+      const dmg = from === 'player' ? def.dmg * this.hustle.gunMul : def.dmg;
+      if (from === 'player') this.killCtx = { head: !!r.head, melee: false };
+      const killed = r.npc.hurt(dmg, this, origin.x, origin.z, !!r.head, from === 'player', 0);
+      this.killCtx = { head: false, melee: false };
       this.fx.spark(end, n, 3, [0.8, 0.1, 0.1]);
-      if (from === 'player') { hud.hitMarker = killed ? 2 : 1; this.audio.hit(); }
+      if (from === 'player') {
+        hud.hitMarker = killed ? 2 : 1; this.audio.hit();
+        this.floaterAt(end.x, end.y + 0.25, end.z, r.head ? `${Math.round(dmg * 2.6)} HEAD` : `${Math.round(dmg)}`, r.head ? 'crit' : 'dmg');
+        if (!killed) this.hustle.addStyle(r.head ? 12 : 4, r.head ? 'HEADSHOT' : 'HIT');
+        if (r.head && !killed) this.camShake += 0.05;
+      }
     } else if (r.kind === 'vehicle' && r.veh) {
       r.veh.damage(def.dmg * 2.2);
       this.fx.spark(end, n, 4);
@@ -1052,23 +1139,136 @@ export class Game {
     return best;
   }
 
-  private doMelee(def: WeaponDef) {
+  private lunge() {
+    const p = this.player;
+    const cf = { x: Math.sin(this.camYaw), z: Math.cos(this.camYaw) };
+    const { ix, iz } = this.moveInput();
+    const cr = { x: -Math.cos(this.camYaw), z: Math.sin(this.camYaw) };
+    let dx = cf.x * iz + cr.x * ix, dz = cf.z * iz + cr.z * ix;
+    const l = Math.hypot(dx, dz);
+    if (l > 0) { dx /= l; dz /= l; } else { dx = Math.sin(p.heading); dz = Math.cos(p.heading); }
+    // soft lock-on: the nearest enemy in front of you
+    let best: Npc | null = null, bs = 1e9;
+    for (const n of this.crowd.list) {
+      if (!n.alive || n.removed) continue;
+      const tx = n.x - p.x, tz = n.z - p.z, d = Math.hypot(tx, tz);
+      if (d > 4.6 || d < 0.01) continue;
+      const dot = (tx * dx + tz * dz) / d;
+      if (dot < 0.3) continue;
+      const score = d - dot * 1.2 - (n.hostile ? 1.2 : 0);
+      if (score < bs) { bs = score; best = n; }
+    }
+    if (best) {
+      const tx = best.x - p.x, tz = best.z - p.z, d = Math.hypot(tx, tz);
+      this.meleeFace = Math.atan2(tx, tz);
+      p.heading = this.meleeFace;
+      if (d > 1.15) { const sp = Math.min(10, (d - 0.95) * 9); this.lungeV = { x: (tx / d) * sp, z: (tz / d) * sp }; this.lungeT = 0.14; }
+    } else {
+      this.meleeFace = Math.atan2(dx, dz);
+      this.lungeV = { x: dx * 3.2, z: dz * 3.2 }; this.lungeT = 0.1;
+    }
+  }
+
+  private doMelee(def: WeaponDef, stage = 0) {
     const p = this.player;
     let hitAny = false;
     const fx = Math.sin(p.heading), fz = Math.cos(p.heading);
     this.crime(1, p.x, p.z);
+    const fin = stage === 2;
+    const mult = [1, 1.15, 1.9][stage] * this.hustle.meleeMul;
+    const reach = def.range + (fin ? 1.0 : 0.55);
     for (const n of this.crowd.list) {
       if (!n.alive) continue;
       const dx = n.x - p.x, dz = n.z - p.z;
       const d = Math.hypot(dx, dz);
-      if (d > def.range + 0.4 || (dx * fx + dz * fz) / (d || 1) < 0.25) continue;
-      n.hurt(def.dmg, this, p.x, p.z, false, true, 5);
-      n.human.flinch();
+      if (d > reach || (dx * fx + dz * fz) / (d || 1) < (fin ? -0.15 : 0.2)) continue;
+      const dmg = def.dmg * mult;
+      this.killCtx = { head: false, melee: true };
+      const killed = n.hurt(dmg, this, p.x, p.z, false, true, fin ? 11 : stage === 1 ? 4.5 : 3.2);
+      this.killCtx = { head: false, melee: false };
+      if (killed && fin) { n.vx *= 1.7; n.vz *= 1.7; }
+      if (!killed) { n.stagger(fin ? 1.5 : 0.45); n.human.flinch(); }
       hitAny = true;
-      this.fx.spark(new THREE.Vector3(n.x, n.y + 1.3, n.z), new THREE.Vector3(-fx, 0.2, -fz), 2, [0.9, 0.3, 0.2]);
+      this.fx.spark(new THREE.Vector3(n.x, n.y + 1.3, n.z), new THREE.Vector3(-fx, 0.2, -fz), fin ? 6 : 3, [0.9, 0.3, 0.2]);
+      this.floaterAt(n.x, n.y + 2.0 * n.human.height, n.z, fin ? `${Math.round(dmg)} FINISHER` : `${Math.round(dmg)}`, fin ? 'crit' : 'dmg');
+      if (n.role === 'gang' || n.role === 'cop' || n.role === 'swat') this.hustle.addStyle(fin ? 28 : 7 + stage * 2, fin ? 'FINISHER' : `COMBO x${this.combo}`);
+      if (fin && (n.role === 'gang')) this.hustle.progress('finishers');
       if (n.role === 'cop' || n.role === 'swat') this.crime(4, n.x, n.z);
     }
-    if (hitAny) { this.audio.punch(); hud.hitMarker = 1; this.camShake += 0.1; }
+    if (hitAny) {
+      this.audio.punch(); hud.hitMarker = fin ? 2 : 1;
+      this.camShake += fin ? 0.4 : 0.12;
+      this.hitStop = Math.max(this.hitStop, fin ? 0.13 : 0.05);
+      if (fin) this.camPitch -= 0.03;
+    } else if (this.comboT < 5) { this.comboT = 9; }
+  }
+
+  /** gentle bullet magnetism so gunfights feel fair: picks the hostile closest to your crosshair */
+  private assistTarget(camPos: THREE.Vector3, camDir: THREE.Vector3, def: WeaponDef, maxAng: number): THREE.Vector3 | null {
+    let best: THREE.Vector3 | null = null, ba = maxAng;
+    for (const n of this.crowd.list) {
+      if (!n.alive || n.removed || (n.role === 'ped' && !n.hostile) || n.role === 'story') continue;
+      const s = n.human.height;
+      const chest = new THREE.Vector3(n.x, n.y + 1.15 * s, n.z);
+      const to = chest.clone().sub(camPos);
+      const dist = to.length();
+      if (dist > def.range * 0.9 || dist < 2) continue;
+      to.divideScalar(dist);
+      const ang = Math.acos(clamp(to.dot(camDir), -1, 1));
+      if (ang > ba) continue;
+      const wr = this.world.rayBoxes(camPos.x, camPos.y, camPos.z, to.x, to.y, to.z, dist);
+      if (wr < dist - 0.8) continue;
+      ba = ang;
+      best = this.player.aim && ang < maxAng * 0.55 ? new THREE.Vector3(n.x, n.y + 1.62 * s, n.z) : chest;
+    }
+    return best;
+  }
+
+  private updateTargeting() {
+    const p = this.player;
+    const cls = WEAPONS[this.weapon].cls;
+    if (p.vehicle || this.interiors.current || (cls !== 'pistol' && cls !== 'twohand')) { hud.onTarget = false; return; }
+    const d = new THREE.Vector3(); this.camera.getWorldDirection(d);
+    const c = this.camera.position;
+    const r = this.castRay(c.x, c.y, c.z, d.x, d.y, d.z, 90, { skipPlayer: true });
+    hud.onTarget = r.kind === 'npc' && !!r.npc && (r.npc.role !== 'ped' || r.npc.hostile);
+  }
+
+  npcMeleeHit(n: Npc, dmg: number) {
+    const p = this.player;
+    if (this.state !== 'play') return;
+    const dx = n.x - p.x, dz = n.z - p.z;
+    if (this.dodgeT > 0.08) { this.damagePlayer(dmg, n.x, n.z); return; }
+    if (p.block && (dx * Math.sin(p.heading) + dz * Math.cos(p.heading)) > -0.3) {
+      if (this.blockT < 0.3) {
+        n.stagger(1.7); n.human.flinch();
+        this.hustle.parry();
+        this.hitStop = Math.max(this.hitStop, 0.14);
+        this.fx.spark(new THREE.Vector3(p.x + dx * 0.4, p.y + 1.3, p.z + dz * 0.4), new THREE.Vector3(0, 0.5, 0), 8, [1, 0.9, 0.5]);
+        this.floaterAt(p.x, p.y + 2, p.z, 'PARRY!', 'good');
+        this.audio.punch(); this.camShake += 0.25;
+        n.vx -= dx * 0.8; n.vz -= dz * 0.8;
+        return;
+      }
+      this.floaterAt(p.x, p.y + 2, p.z, 'BLOCKED', 'info');
+      this.audio.hit();
+      this.damagePlayer(dmg * 0.2, n.x, n.z);
+      return;
+    }
+    this.damagePlayer(dmg, n.x, n.z);
+    const d = Math.hypot(dx, dz) || 1;
+    p.vx -= (dx / d) * 4; p.vz -= (dz / d) * 4;
+    this.camShake += 0.3;
+    this.audio.punch();
+  }
+
+  floaterAt(x: number, y: number, z: number, text: string, kind: 'dmg' | 'crit' | 'info' | 'warn' | 'good' = 'info') {
+    const v = new THREE.Vector3(x, y, z).project(this.camera);
+    if (v.z > 1 || Math.abs(v.x) > 1.1 || Math.abs(v.y) > 1.1) return;
+    const id = this.floaterId++;
+    hud.floaters = [...hud.floaters.slice(-9), { id, x: (v.x * 0.5 + 0.5) * 100, y: (-v.y * 0.5 + 0.5) * 100, text, kind }];
+    emitHud();
+    setTimeout(() => { hud.floaters = hud.floaters.filter((f) => f.id !== id); emitHud(); }, kind === 'warn' ? 520 : 950);
   }
 
   private launchRocket(from: THREE.Vector3, to: THREE.Vector3, owner: 'player' | 'npc') {
@@ -1166,6 +1366,8 @@ export class Game {
       else if (n.role === 'ped') this.crime(3, n.x, n.z);
       hud.hitMarker = 2;
     }
+    if (byPlayer) this.hustle.onKill(n, this.killCtx.head, this.killCtx.melee);
+    this.killCtx = { head: false, melee: false };
     this.crowd.scareAround(n.x, n.z, 30);
   }
 
@@ -1220,6 +1422,17 @@ export class Game {
   damagePlayer(n: number, sx: number, sz: number) {
     if (this.state !== 'play' || this.flags.god) return;
     const p = this.player;
+    if (this.dodgeT > 0.08) {
+      if (n >= 2 && this.time - this.perfectT > 0.7) {
+        this.perfectT = this.time;
+        this.hustle.perfectDodge();
+        this.bulletT = 0.85; this.slowmo = 0.4;
+        this.floaterAt(p.x, p.y + 1.9, p.z, 'PERFECT DODGE', 'good');
+      }
+      return;
+    }
+    n *= this.hustle.dmgTaken;
+    this.hustle.onDamaged(n);
     if (p.armor > 0) { const a = Math.min(p.armor, n * 0.65); p.armor -= a; n -= a; }
     p.hp -= n;
     this.lastDamage = this.time;
@@ -1280,6 +1493,7 @@ export class Game {
       v.update(dt, this.world, night);
     }
     if (pv) pv.update(dt, this.world, night);
+    if (pv && pv.skid && Math.abs(pv.speed) > 10 && this.state === 'play') this.hustle.drift(Math.abs(pv.speed) * dt);
     // vehicle-vehicle collisions
     const vs = this.vehicles;
     for (let i = 0; i < vs.length; i++) {
@@ -1446,11 +1660,13 @@ export class Game {
     const dirx = -Math.sin(this.camYaw) * cp, diry = sp2, dirz = -Math.cos(this.camYaw) * cp;
     // camera collision
     let dist = this.camDist;
-    const hitT = this.world.rayBoxes(tx, ty, tz, dirx, diry, dirz, dist + 0.3);
+    const indoors = !!this.interiors.current;
+    const hitT = indoors ? Infinity : this.world.rayBoxes(tx, ty, tz, dirx, diry, dirz, dist + 0.3);
     if (hitT < dist + 0.3) dist = Math.max(0.6, hitT - 0.3);
     let cx = tx + dirx * dist, cy = ty + diry * dist, cz = tz + dirz * dist;
-    const gy = this.world.groundY(cx, cz);
+    const gy = indoors ? 0 : this.world.groundY(cx, cz);
     cy = Math.max(cy, gy + 0.3);
+    if (indoors) { const cv = new THREE.Vector3(cx, cy, cz); this.interiors.clampCam(cv); cx = cv.x; cy = cv.y; cz = cv.z; }
     const shake = (this.camShake + this.fx.shake * 0.5);
     this.camShake = Math.max(0, this.camShake - dt * 2.2);
     cx += (Math.random() - 0.5) * shake * 0.12; cy += (Math.random() - 0.5) * shake * 0.12;
@@ -1463,6 +1679,8 @@ export class Game {
     cam.fov = damp(cam.fov, wantFov, 5, dt);
     cam.updateProjectionMatrix();
   }
+
+  updateCameraSnap() { this.updateCamera(0.016, true); }
 
   cinematic(from: THREE.Vector3, to: THREE.Vector3, look: THREE.Vector3, dur: number) {
     this.cinematicCam = { from, to, look, t: 0, dur };
@@ -1627,7 +1845,7 @@ export class Game {
   saveGame() {
     try {
       const inv: Record<string, { have: boolean; mag: number; reserve: number }> = this.inv;
-      localStorage.setItem('neon-nagri-v2', JSON.stringify({ cash: this.player.cash, inv, mission: this.missionIndex, done: [...this.completed], hour: this.sky.hour, owned: this.ownedCars, kills: hud.stats.kills }));
+      localStorage.setItem('neon-nagri-v2', JSON.stringify({ cash: this.player.cash, inv, mission: this.missionIndex, done: [...this.completed], hour: this.sky.hour, owned: this.ownedCars, kills: hud.stats.kills, hustle: this.hustle?.serialize() }));
     } catch { /* ignore */ }
   }
   loadGame() {
@@ -1641,6 +1859,7 @@ export class Game {
       this.completed = new Set(s.done ?? []);
       this.sky.hour = s.hour ?? this.sky.hour;
       this.ownedCars = s.owned ?? [];
+      if (s.hustle) this.hustle.restore(s.hustle);
     } catch { /* ignore */ }
   }
   resetSave() {
@@ -1743,6 +1962,7 @@ export class Game {
       dot(poi.x, poi.z, big ? 7 : 5, poi.kind === 'shop' ? '#ffb02a' : poi.kind === 'story' ? '#ff4fd8' : poi.kind === 'home' ? '#4ad0ff' : poi.kind === 'mission' ? '#6aff9a' : '#c8d0e0', true);
     }
     for (const m of this.markers) dot(m.x, m.z, big ? 9 : 7, m.color ?? '#ffd23a', true);
+    for (const m of this.hustle.markers) dot(m.x, m.z, big ? 10 : 8, m.color ?? '#ff3a5a', true);
     for (const v of this.vehicles) {
       if (v.sirenOn && !v.wrecked) { const f = Math.floor(this.time * 4) % 2; dot(v.x, v.z, 5, f ? '#ff3030' : '#3060ff', true); }
     }

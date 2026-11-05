@@ -1025,9 +1025,9 @@ export class World {
   update(dt: number, t: number, focus: THREE.Vector3, night: number) {
     this.nightF = night;
     { const nm = (this.sea.material as THREE.MeshPhongMaterial).normalMap; if (nm) { nm.offset.x += dt * 0.004; nm.offset.y += dt * 0.0025; } }
-    for (const m of this.facadeMats) m.emissiveIntensity = night * 1.4;
-    this.lampMat.emissiveIntensity = night * 3;
-    for (const m of this.signMats) m.emissiveIntensity = 0.5 + night * 1.5;
+    for (const m of this.facadeMats) m.emissiveIntensity = night * 0.85;
+    this.lampMat.emissiveIntensity = night * 1.8;
+    for (const m of this.signMats) m.emissiveIntensity = 0.35 + night * 0.9;
     if (Math.floor(t * 2) !== Math.floor((t - dt) * 2)) this.updateSignals(t);
     // assign pooled lights to nearest lamps
     if (night > 0.15) {
@@ -1038,7 +1038,7 @@ export class World {
         .slice(0, this.lampLights.length);
       this.lampLights.forEach((l, i) => {
         const o = near[i];
-        if (o) { l.position.copy(o.p); l.intensity = night * 220; } else l.intensity = 0;
+        if (o) { l.position.copy(o.p); l.intensity = night * 140; } else l.intensity = 0;
       });
     } else this.lampLights.forEach((l) => (l.intensity = 0));
   }

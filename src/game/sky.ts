@@ -43,8 +43,8 @@ void main(){
   vec3 col = mix(uHorizon, uZenith, t);
   // sun glow & disc
   float sd = max(dot(d, uSun), 0.0);
-  col += uSunCol * (pow(sd, 6.0) * 0.35 + pow(sd, 120.0) * 1.2) * uDay;
-  col += uSunCol * pow(sd, 1500.0) * 40.0 * uDay;
+  col += uSunCol * (pow(sd, 6.0) * 0.22 + pow(sd, 120.0) * 0.45) * uDay;
+  col += uSunCol * pow(sd, 1500.0) * 3.0 * uDay;
   // horizon haze band
   col = mix(col, uHorizon * 1.05, pow(1.0 - clamp(abs(d.y)*2.2,0.0,1.0), 3.0) * 0.5);
   // moon
@@ -88,12 +88,13 @@ export class Sky {
   moon: THREE.DirectionalLight;
   hemi: THREE.HemisphereLight;
   fog: THREE.FogExp2;
-  hour = 17.2;
+  hour = 10.5;
   rain = 0;
   rainTarget = 0;
   cloud = 0.3;
   night = 0;
   day = 1;
+  indoor = 0;
   sunDir = new THREE.Vector3();
   private envScene = new THREE.Scene();
   private pmrem: THREE.PMREMGenerator;
@@ -190,27 +191,28 @@ export class Sky {
     u.uZenith.value.copy(zen);
     u.uHorizon.value.copy(hor);
     u.uSunCol.value.copy(sunCol);
-    const sunI = 3.4 * smooth(-0.02, 0.22, e) * (1 - this.rain * 0.7);
+    const sunI = 2.3 * smooth(-0.02, 0.22, e) * (1 - this.rain * 0.7);
     this.sun.color.copy(sunCol);
     this.sun.intensity = sunI;
     this.sun.visible = sunI > 0.02;
     this.moon.intensity = this.night * 0.55 * (1 - this.rain * 0.5);
     this.moon.position.set(-this.sunDir.x * 200, Math.max(30, -this.sunDir.y * 200), 80);
-    this.hemi.intensity = 0.2 + dayK * 0.55;
+    const ind = 1 - 0.72 * this.indoor;
+    this.hemi.intensity = (0.28 + dayK * 0.42) * ind;
     this.hemi.color.copy(zen).lerp(new THREE.Color(1, 1, 1), 0.35);
     this.hemi.groundColor.set(0x3a362f).multiplyScalar(0.3 + dayK * 0.8);
     this.fog.color.copy(hor);
     this.fog.density = lerp(0.0007, 0.0024, this.rain) + (1 - dayK) * 0.0004;
-    this.renderer.toneMappingExposure = lerp(1.25, 0.95, dayK) * (1 - this.rain * 0.1);
+    this.renderer.toneMappingExposure = lerp(1.05, 0.78, dayK) * (1 - this.rain * 0.1);
     if (force || Math.abs(this.hour - this.lastEnvHour) > 0.35) {
       this.lastEnvHour = this.hour;
       const rt = this.pmrem.fromScene(this.envScene, 0, 0.1, 2000);
       this.envRT?.dispose();
       this.envRT = rt;
       this.scene.environment = rt.texture;
-      this.scene.environmentIntensity = 0.35 + dayK * 0.85;
+      this.scene.environmentIntensity = (0.3 + dayK * 0.55) * ind;
     } else {
-      this.scene.environmentIntensity = 0.3 + dayK * 0.9;
+      this.scene.environmentIntensity = (0.28 + dayK * 0.55) * ind;
     }
   }
 

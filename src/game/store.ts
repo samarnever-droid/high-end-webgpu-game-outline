@@ -23,6 +23,12 @@ export interface HudState {
   missions: { id: number; title: string; done: boolean; active: boolean }[];
   hint: string | null;
   fps: number;
+  style: { rank: string; mult: number; pct: number; bank: number; label: string; labelId: number; active: boolean; chainT: number };
+  rep: { level: number; xp: number; need: number };
+  challenges: { id: number; text: string; prog: number; goal: number; done: boolean; cash: number }[];
+  event: { title: string; text: string; t: number | null } | null;
+  floaters: { id: number; x: number; y: number; text: string; kind: 'dmg' | 'crit' | 'info' | 'warn' | 'good' }[];
+  onTarget: boolean; blocking: boolean; dodgeCd: number; combo: number;
   stats: { kills: number; distance: number; missions: number };
 }
 
@@ -38,6 +44,10 @@ export const hud: HudState = {
   overlay: null, overlayText: '', fade: false, cinematic: false, aiming: false, hitMarker: 0, damage: 0, locked: false,
   settings: { volume: 0.7, music: 0.6, shadows: true, bloom: true, sens: 1, timeScale: 1, quality: 'high' },
   missions: [], hint: null, fps: 60,
+  style: { rank: 'D', mult: 1, pct: 0, bank: 0, label: '', labelId: 0, active: false, chainT: 0 },
+  rep: { level: 1, xp: 0, need: 250 },
+  challenges: [], event: null, floaters: [],
+  onTarget: false, blocking: false, dodgeCd: 0, combo: 0,
   stats: { kills: 0, distance: 0, missions: 0 },
 };
 

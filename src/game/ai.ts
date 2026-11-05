@@ -43,6 +43,8 @@ export class Npc {
   inCar: Vehicle | null = null;
   seenPlayer = false;
   cash = 0;
+  brawler = false;
+  atkT = 0; atkCd = 0.6; atkHit = false; stunT = 0; alerted = false;
   private lookT = 0;
 
   constructor(look: Look, role: NpcRole = 'ped') {
@@ -65,6 +67,8 @@ export class Npc {
   }
 
   get alive() { return this.state !== 'dead'; }
+  get isMelee() { return !this.wm || this.weapon === 'bat' || this.weapon === 'fists'; }
+  stagger(t: number) { this.stunT = Math.max(this.stunT, t); this.atkT = 0; this.atkCd = Math.max(this.atkCd, 0.6); }
 
   place(x: number, z: number, h = 0) {
     this.x = x; this.z = z; this.heading = h;
@@ -241,6 +245,13 @@ export class Npc {
   private combat(dt: number, g: Game, dist: number, dx: number, dz: number) {
     const hs = this.hs;
     hs.stance = 'stand';
+    if (this.stunT > 0) {
+      this.stunT -= dt;
+      this.vx = damp(this.vx, 0, 4, dt); this.vz = damp(this.vz, 0, 4, dt);
+      this.x += this.vx * dt; this.z += this.vz * dt;
+      hs.vf = 0; hs.aim = false;
+      return;
+    }
     const w = WEAPONS[this.weapon];
     const wantedCop = (this.role === 'cop' || this.role === 'swat') && g.wanted > 0;
     const engage = (this.role === 'gang' && this.hostile) || wantedCop || this.state === 'attack';
@@ -262,6 +273,7 @@ export class Npc {
     }
     this.seenPlayer = sees;
     const want = Math.atan2(dx, dz);
+    if (this.isMelee && this.role === 'gang') { this.meleeAI(dt, g, dist, dx, dz, sees); return; }
     const pref = this.role === 'cop' ? 13 : this.role === 'swat' ? 16 : 17;
     const run = 4.6;
     if (dist > 110 && this.role === 'gang') { hs.vf = 0; return; }
@@ -298,6 +310,44 @@ export class Npc {
         this.burst--;
         if (this.burst <= 0) this.burstT = 0.7 + Math.random() * 1.3;
         g.npcShoot(this, w);
+      }
+    }
+  }
+
+  /** brawler AI: rush the player, telegraph, then swing. Dodge (Q) or block (RMB) the swing! */
+  private meleeAI(dt: number, g: Game, dist: number, dx: number, dz: number, sees: boolean) {
+    const hs = this.hs;
+    const want = Math.atan2(dx, dz);
+    this.atkCd -= dt;
+    if (this.atkT > 0) {
+      this.atkT += dt;
+      this.heading = dampAngle(this.heading, want, 4, dt);
+      this.vx = damp(this.vx, 0, 10, dt); this.vz = damp(this.vz, 0, 10, dt);
+      if (this.atkT > 0.28 && !this.alerted) { this.alerted = true; this.human.punch(); }
+      if (this.atkT > 0.46 && !this.atkHit) {
+        this.atkHit = true;
+        const reach = this.weapon === 'bat' ? 2.5 : 2.1;
+        if (dist < reach) g.npcMeleeHit(this, this.weapon === 'bat' ? 15 : 9);
+      }
+      if (this.atkT > 0.85) { this.atkT = 0; this.atkCd = 0.6 + Math.random() * 1.1; }
+      return;
+    }
+    const run = 4.9;
+    if (dist > 1.8 || (!sees && dist > 2.2)) {
+      this.heading = dampAngle(this.heading, want + (sees ? 0 : this.strafe * 0.6), 8, dt);
+      this.vx = damp(this.vx, Math.sin(this.heading) * run, 7, dt);
+      this.vz = damp(this.vz, Math.cos(this.heading) * run, 7, dt);
+      this.x += this.vx * dt; this.z += this.vz * dt;
+      hs.vf = run;
+    } else {
+      this.heading = dampAngle(this.heading, want, 10, dt);
+      const sx = Math.cos(want) * this.strafe * 1.1, sz = -Math.sin(want) * this.strafe * 1.1;
+      this.vx = damp(this.vx, sx, 6, dt); this.vz = damp(this.vz, sz, 6, dt);
+      this.x += this.vx * dt; this.z += this.vz * dt;
+      hs.vs = -this.strafe * 1.1;
+      if (this.atkCd <= 0) {
+        this.atkT = 0.001; this.atkHit = false; this.alerted = false;
+        g.floaterAt(this.x, this.y + 2.1 * this.human.height, this.z, '!', 'warn');
       }
     }
   }

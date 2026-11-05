@@ -3,6 +3,7 @@ import type { Game } from '../game/game';
 import { useHud, emitHud, hud } from '../game/store';
 import { STATIONS } from '../game/audio';
 import { fmtMoney } from '../game/util';
+import { HookHud } from './hook';
 
 const font = { fontFamily: '"Arial Black", Impact, "Segoe UI", sans-serif' };
 const shadow = { textShadow: '0 2px 0 rgba(0,0,0,.9), 0 0 12px rgba(0,0,0,.6)' };
@@ -35,7 +36,7 @@ export function MainMenu({ game }: { game: Game }) {
       <div className="flex w-[520px] flex-col justify-center px-16">
         <div className="text-7xl leading-none" style={{ ...font, ...shadow, letterSpacing: '-3px' }}>NEON<br /><span className="bg-gradient-to-r from-fuchsia-400 to-cyan-300 bg-clip-text text-transparent">NAGRI</span></div>
         <div className="mt-2 text-sm tracking-[0.55em] text-cyan-300">RELOADED</div>
-        <p className="mt-6 max-w-sm text-sm leading-relaxed text-white/70">An open-world crime story. Real bodies, real cars, real heat. Work for Dev, outrun the police, and take down Raghav&apos;s empire.</p>
+        <p className="mt-6 max-w-sm text-sm leading-relaxed text-white/70">Chain combos, dodge and parry to build your Style meter and bank cash. Live street events, rotating challenges and Street Rep perks — there is always one more thing. Walk into shops, work for Dev, take down Raghav&apos;s empire.</p>
         <button
           className="mt-8 w-64 rounded-md bg-gradient-to-r from-fuchsia-500 to-cyan-500 px-6 py-3 text-left text-lg tracking-wide shadow-lg shadow-fuchsia-900/40 transition hover:scale-[1.03]"
           style={font}
@@ -48,6 +49,7 @@ export function MainMenu({ game }: { game: Game }) {
           <Key k="WASD" t="Move / Drive" /><Key k="Shift" t="Sprint / Nitro" /><Key k="Mouse" t="Look" /><Key k="RMB / LMB" t="Aim / Shoot" />
           <Key k="E / F" t="Interact / Enter car" /><Key k="Space" t="Jump / Handbrake" /><Key k="1-7" t="Weapons" /><Key k="R" t="Reload / Radio" />
           <Key k="C" t="Crouch / Look back" /><Key k="H" t="Horn" /><Key k="M" t="Map" /><Key k="T" t="Phone" />
+          <Key k="LMB ×3" t="Combo + finisher" /><Key k="RMB (melee)" t="Block · parry" /><Key k="Q" t="Dodge roll (i-frames)" /><Key k="Doors" t="Walk into shops [E]" />
         </div>
         <div className="mt-6 text-[11px] text-white/40">{h.fps} fps · click the game to capture the mouse · best on desktop with a GPU</div>
       </div>
@@ -137,6 +139,8 @@ export function Hud({ game }: { game: Game }) {
         </div>
       )}
       {h.hint && !h.objective && <div className="absolute left-1/2 top-5 -translate-x-1/2 rounded bg-black/55 px-4 py-1.5 text-sm text-white/90">{h.hint}</div>}
+
+      <HookHud />
 
       {/* crosshair */}
       {h.aiming && !h.inCar && (
