@@ -4,6 +4,10 @@ import {
   FACADE_H, FACADE_W, asphaltTex, concreteTex, crosswalkTex, facadeTex, grassTex, roadTex, roofTex, sandTex, sidewalkTex, signTex, waterNormal, type FacadeKind,
 } from './textures';
 import { mulberry32, pick, range, type RNG } from './util';
+import { patchWet } from './wet';
+import { createWater, updateWater } from './water';
+import { frondTexture, makeCrownGeometry, makeGlow, makeMountainGeometry, makePalmGeometries, makeTankGeometry, makeTrunkGeometry, patchFoliage, windUniform } from './props';
+import type { Sky } from './sky';
 
 export const N = 8; // blocks per side
 export const P = 120; // pitch (block + road)
@@ -108,6 +112,11 @@ export class World {
   sidewalkPts: { x: number; z: number }[] = [];
   private tlDummy = new THREE.Object3D();
   private nightF = 0;
+  glow!: THREE.Points;
+  aviation!: THREE.Points;
+  private aviationPts: THREE.Vector3[] = [];
+  private tankPts: { x: number; y: number; z: number; r: number }[] = [];
+  private detailRng = mulberry32(777);
 
   constructor(seed = 20260517) {
     this.rng = mulberry32(seed);
@@ -156,12 +165,13 @@ export class World {
   private buildGround() {
     const grass = grassTex();
     const tex = grass.map;
-    tex.repeat.set(220, 220);
-    grass.normal!.repeat.set(220, 220);
+    const GW = HALF + 30 + 2000;
+    tex.repeat.set(220 * GW / 4000, 220);
+    grass.normal!.repeat.set(220 * GW / 4000, 220);
     const gmat = new THREE.MeshStandardMaterial({ map: tex, normalMap: grass.normal, roughness: 1, color: 0xb8c8a0 });
-    const g = new THREE.Mesh(new THREE.PlaneGeometry(4000, 4000), gmat);
+    const g = new THREE.Mesh(new THREE.PlaneGeometry(GW, 4000), gmat);
     g.rotation.x = -Math.PI / 2;
-    g.position.y = -0.05;
+    g.position.set((-2000 + HALF + 30) / 2, -0.05, 0);
     g.receiveShadow = true;
     this.group.add(g);
   }
@@ -170,7 +180,7 @@ export class World {
     const r = roadTex();
     const rm = r.map.clone(); rm.repeat.set(1, (N * P + 40) / 12); rm.needsUpdate = true;
     const rn = r.normal!.clone(); rn.repeat.set(2, (N * P) / 12 * 1.0); rn.needsUpdate = true;
-    const mat = new THREE.MeshStandardMaterial({ map: rm, normalMap: rn, roughness: 0.82, metalness: 0.0, normalScale: new THREE.Vector2(0.8, 0.8) });
+    const mat = patchWet(new THREE.MeshStandardMaterial({ map: rm, normalMap: rn, roughness: 0.82, metalness: 0.0, normalScale: new THREE.Vector2(0.8, 0.8) }));
     const len = N * P + ROAD_W;
     // v-direction texture is along road length; same texture clones for the perpendicular roads (rotated geometry)
     for (let k = 0; k <= N; k++) {
@@ -190,10 +200,10 @@ export class World {
     const at = asphaltTex();
     const am = at.map.clone(); am.repeat.set(4, 4); am.needsUpdate = true;
     const an = at.normal!.clone(); an.repeat.set(8, 8); an.needsUpdate = true;
-    const imat = new THREE.MeshStandardMaterial({ map: am, normalMap: an, roughness: 0.82 });
+    const imat = patchWet(new THREE.MeshStandardMaterial({ map: am, normalMap: an, roughness: 0.82 }));
     const inter = new THREE.InstancedMesh(new THREE.PlaneGeometry(ROAD_W, ROAD_W), imat, (N + 1) * (N + 1));
     const cwTex = crosswalkTex();
-    const cwMat = new THREE.MeshStandardMaterial({ map: cwTex, transparent: true, roughness: 0.8, depthWrite: false, polygonOffset: true, polygonOffsetFactor: -2 });
+    const cwMat = patchWet(new THREE.MeshStandardMaterial({ map: cwTex, transparent: true, roughness: 0.8, depthWrite: false, polygonOffset: true, polygonOffsetFactor: -2 }), 0.6);
     const cw = new THREE.InstancedMesh(new THREE.PlaneGeometry(ROAD_W - 1, 3.2), cwMat, (N + 1) * (N + 1) * 4);
     const d = new THREE.Object3D();
     let n = 0, m = 0;
@@ -270,7 +280,7 @@ export class World {
           const hh = floors * FLOOR_H;
           const mat = `f-${kind}-${variant}`;
           const acc = get(chunkX, chunkZ, mat);
-          const uo = rng() * 4;
+          const uo = Math.floor(rng() * 4);
           // walls
           const wall = (ax: number, az: number, bx2: number, bz2: number, len: number) => {
             acc.quad([ax, 0, az], [bx2, 0, bz2], [bx2, hh, bz2], [ax, hh, az], [[uo, 0], [uo + len / FACADE_W, 0], [uo + len / FACADE_W, hh / FACADE_H], [uo, hh / FACADE_H]]);
@@ -328,6 +338,51 @@ export class World {
           } else if (floors > 2) {
             pl.box(bx, 3.3, z0 + d + 1.0, 8, 0.2, 2.0, C(0x303034));
             pl.box(bx, 0, z0 + d + 0.05, 5, 3.0, 0.1, C(0x15161a));
+          }
+          // ---- architectural detail (own RNG so the city layout is untouched)
+          {
+            const dr = this.detailRng;
+            const tone = (k: number) => new THREE.Color().setHSL(0.09, 0.06, k);
+            if (floors > 1 && kind !== 'glass') pl.box(bx, 0, bz, w + 0.3, 0.9, d + 0.3, C(0x4a4743));
+            if (!gable) {
+              pl.box(bx, hh - 0.6, bz, w + 0.7, 0.6, d + 0.7, tone(0.5));
+              pl.box(bx, hh - 0.08, bz, w + 1.0, 0.16, d + 1.0, tone(0.34));
+            }
+            if (floors >= 5) {
+              for (let fl = kind === 'glass' ? 6 : 4; fl < floors; fl += kind === 'glass' ? 6 : 4) {
+                pl.box(bx, fl * FLOOR_H - 0.2, bz, w + 0.4, 0.4, d + 0.4, kind === 'glass' ? C(0x182027) : tone(0.46));
+              }
+            }
+            if (!gable && (kind === 'brick' || kind === 'concrete' || kind === 'apartment' || kind === 'office')) {
+              for (const [px, pz] of [[x0, z0], [x0 + w, z0], [x0, z0 + d], [x0 + w, z0 + d]]) pl.box(px, 0, pz, 0.8, hh, 0.8, tone(0.5));
+            }
+            if (kind === 'apartment' && floors >= 3 && !sp2) {
+              const bays = Math.floor(w / 3);
+              for (const face of [1, -1]) {
+                for (let fl = 1; fl < floors; fl++) {
+                  for (let b = 0; b < bays; b += 2) {
+                    if (dr() < 0.3) continue;
+                    const cxb = face > 0 ? x0 + 1.5 + 3 * b : x0 + w - 1.5 - 3 * b;
+                    const zf = face > 0 ? z0 + d + 0.6 : z0 - 0.6;
+                    const y0b = fl * FLOOR_H;
+                    pl.box(cxb, y0b + 0.02, zf, 2.3, 0.16, 1.3, tone(0.52));
+                    pl.box(cxb, y0b + 0.18, zf + face * 0.62, 2.3, 0.62, 0.07, tone(0.6));
+                    pl.box(cxb - 1.12, y0b + 0.18, zf, 0.07, 0.62, 1.2, tone(0.6));
+                    pl.box(cxb + 1.12, y0b + 0.18, zf, 0.07, 0.62, 1.2, tone(0.6));
+                    if (dr() < 0.28) pl.box(cxb + 0.3, y0b + 0.18, zf + face * 0.2, 0.8, 0.62, 0.55, C(0xb4b8bc)); // split AC unit
+                    else if (dr() < 0.3) pl.box(cxb, y0b + 0.18, zf, 0.9, 0.3, 0.5, C(dr() < 0.5 ? 0xa04030 : 0x3a6a8a)); // flower box / laundry
+                  }
+                }
+              }
+            }
+            if (!gable) {
+              if (floors >= 3 && w > 14 && dr() < 0.4) this.tankPts.push({ x: x0 + 3 + dr() * (w - 6), y: hh, z: z0 + 3 + dr() * (d - 6), r: dr() * 6 });
+              if (floors >= 14) this.aviationPts.push(new THREE.Vector3(bx, hh + 1.3, bz));
+              if (floors >= 8) {
+                // mechanical penthouse + louvres
+                pl.box(bx + (dr() - 0.5) * w * 0.3, hh, bz + (dr() - 0.5) * d * 0.3, Math.min(8, w * 0.3), 3.2, Math.min(8, d * 0.3), tone(0.42));
+              }
+            }
           }
           // colliders
           this.addBox(x0, x0 + w, z0, z0 + d, hh);
@@ -458,7 +513,7 @@ export class World {
     const swm = sw.map.clone(); swm.repeat.set(PAD / 8, PAD / 8); swm.needsUpdate = true;
     const swn = sw.normal!.clone(); swn.repeat.set(PAD / 8, PAD / 8); swn.needsUpdate = true;
     // pad box uv is 0..1 per face; remap by multiplying uv via texture repeat in material
-    const padMat = new THREE.MeshStandardMaterial({ map: swm, normalMap: swn, roughness: 0.9, color: 0xffffff });
+    const padMat = patchWet(new THREE.MeshStandardMaterial({ map: swm, normalMap: swn, roughness: 0.9, color: 0xffffff }), 0.7);
     const mk = (a: Acc, mat: THREE.Material, shadow = true) => {
       const g = a.build();
       if (!g) return;
@@ -473,7 +528,7 @@ export class World {
     mk(padG, new THREE.MeshStandardMaterial({ map: gm2, normalMap: gt.normal, roughness: 1, color: 0xc8d8b0 }), false);
     const ct = concreteTex();
     const cm2 = ct.map.clone(); cm2.repeat.set(1, 1); cm2.needsUpdate = true;
-    mk(padP, new THREE.MeshStandardMaterial({ map: cm2, roughness: 0.95 }), false);
+    mk(padP, patchWet(new THREE.MeshStandardMaterial({ map: cm2, roughness: 0.95 }), 0.8), false);
     const st = sandTex();
     const sm2 = st.map.clone(); sm2.repeat.set(1, 1); sm2.needsUpdate = true;
     mk(padS, new THREE.MeshStandardMaterial({ map: sm2, roughness: 1 }), false);
@@ -497,6 +552,19 @@ export class World {
       m.castShadow = true;
       m.receiveShadow = true;
       this.group.add(m);
+    }
+    // rooftop water tanks
+    if (this.tankPts.length) {
+      const tk = new THREE.InstancedMesh(makeTankGeometry(), new THREE.MeshStandardMaterial({ color: 0x8c8f92, roughness: 0.55, metalness: 0.55 }), this.tankPts.length);
+      const dd = new THREE.Object3D();
+      this.tankPts.forEach((t, i) => { dd.position.set(t.x, t.y, t.z); dd.rotation.set(0, t.r, 0); dd.updateMatrix(); tk.setMatrixAt(i, dd.matrix); });
+      tk.castShadow = true; tk.receiveShadow = true;
+      this.group.add(tk);
+    }
+    // aviation obstruction lights on the tall towers
+    if (this.aviationPts.length) {
+      this.aviation = makeGlow(this.aviationPts, 4.5, 0xff2a18, 0);
+      this.group.add(this.aviation);
     }
   }
 
@@ -630,10 +698,12 @@ export class World {
     // lamp instanced meshes
     const poleG = new THREE.CylinderGeometry(0.1, 0.16, 8.5, 8); poleG.translate(0, 4.25, 0);
     const armG = new THREE.BoxGeometry(0.12, 0.12, 2.4); armG.translate(0, 8.5, 1.1);
-    const headG = new THREE.BoxGeometry(0.5, 0.14, 1.0); headG.translate(0, 8.4, 2.1);
+    const headG = new THREE.BoxGeometry(0.4, 0.03, 0.9); headG.translate(0, 8.43, 2.05);
+    const housingG = new THREE.BoxGeometry(0.52, 0.16, 1.15); housingG.translate(0, 8.54, 2.05);
+    const baseG = new THREE.CylinderGeometry(0.2, 0.26, 0.5, 8); baseG.translate(0, 0.25, 0);
     const metal = new THREE.MeshStandardMaterial({ color: 0x2a2d31, roughness: 0.5, metalness: 0.7 });
     this.lampMat = new THREE.MeshStandardMaterial({ color: 0xffffff, emissive: 0xffd9a0, emissiveIntensity: 0, roughness: 0.3 });
-    const merged = mergeGeometries([poleG, armG]);
+    const merged = mergeGeometries([poleG, armG, housingG, baseG]);
     const lp = new THREE.InstancedMesh(merged, metal, lampPoles.length);
     const lh = new THREE.InstancedMesh(headG, this.lampMat, lampPoles.length);
     lp.castShadow = true;
@@ -649,39 +719,36 @@ export class World {
       this.lampPos.push(new THREE.Vector3(p.x + fx, 8.2, p.z + fz));
     });
     this.group.add(lp, lh);
-    // trees
-    const trunkG = new THREE.CylinderGeometry(0.18, 0.28, 3.4, 7); trunkG.translate(0, 1.7, 0);
-    const leafG = new THREE.IcosahedronGeometry(2.1, 1);
-    const lp2 = leafG.attributes.position;
-    for (let i2 = 0; i2 < lp2.count; i2++) {
-      const x = lp2.getX(i2), y = lp2.getY(i2), z = lp2.getZ(i2);
-      const n = 1 + (Math.sin(x * 3.1 + y * 2.3) * Math.cos(z * 2.7 + y) * 0.2);
-      lp2.setXYZ(i2, x * n, y * n * 0.9, z * n);
-    }
-    leafG.computeVertexNormals();
-    leafG.translate(0, 5, 0);
-    this.treeTrunk = new THREE.InstancedMesh(trunkG, new THREE.MeshStandardMaterial({ color: 0x4a3626, roughness: 1 }), this.trees.length);
-    this.treeLeaf = new THREE.InstancedMesh(leafG, new THREE.MeshStandardMaterial({ color: 0xffffff, roughness: 0.85 }), this.trees.length);
+    this.glow = makeGlow(this.lampPos, 5.5, 0xffc67a, 0);
+    this.group.add(this.glow);
+    // trees: layered smooth crowns with baked AO, wind sway and procedural leaf speckle
+    const crownG = makeCrownGeometry(rng);
+    const barkMat = patchFoliage(new THREE.MeshStandardMaterial({ color: 0x5b4636, roughness: 1 }), 0.15, false);
+    const leafMat = patchFoliage(new THREE.MeshStandardMaterial({ color: 0xffffff, vertexColors: true, roughness: 0.78 }), 1.0, true);
+    this.treeTrunk = new THREE.InstancedMesh(makeTrunkGeometry(), barkMat, this.trees.length);
+    this.treeLeaf = new THREE.InstancedMesh(crownG, leafMat, this.trees.length);
     this.treeTrunk.castShadow = this.treeLeaf.castShadow = true;
+    this.treeLeaf.receiveShadow = true;
     this.trees.forEach((t, idx) => {
       d.position.set(t.x, 0.16, t.z);
       d.rotation.set(0, rng() * 6, 0);
-      d.scale.setScalar(t.s);
+      d.scale.set(t.s * (0.9 + rng() * 0.25), t.s * (0.85 + rng() * 0.4), t.s * (0.9 + rng() * 0.25));
       d.updateMatrix();
       this.treeTrunk.setMatrixAt(idx, d.matrix);
       this.treeLeaf.setMatrixAt(idx, d.matrix);
-      this.treeLeaf.setColorAt(idx, new THREE.Color().setHSL(0.24 + rng() * 0.07, 0.45, 0.2 + rng() * 0.1));
+      this.treeLeaf.setColorAt(idx, new THREE.Color().setHSL(0.22 + rng() * 0.1, 0.5, 0.3 + rng() * 0.12));
     });
     d.scale.setScalar(1);
     this.group.add(this.treeTrunk, this.treeLeaf);
     // palms
     if (this.palms.length) {
-      const pt = new THREE.CylinderGeometry(0.14, 0.24, 8, 6); pt.translate(0, 4, 0);
-      const pm = new THREE.InstancedMesh(pt, new THREE.MeshStandardMaterial({ color: 0x8a6a4a, roughness: 1 }), this.palms.length);
-      const fr = new THREE.ConeGeometry(2.4, 0.5, 7); fr.translate(0, 8.2, 0);
-      const fm = new THREE.InstancedMesh(fr, new THREE.MeshStandardMaterial({ color: 0x2a7a3a, roughness: 0.9, side: THREE.DoubleSide }), this.palms.length);
-      this.palms.forEach((p, idx) => { d.position.set(p.x, 0.1, p.z); d.rotation.set(0, idx, 0); d.updateMatrix(); pm.setMatrixAt(idx, d.matrix); fm.setMatrixAt(idx, d.matrix); });
+      const pg = makePalmGeometries();
+      const pm = new THREE.InstancedMesh(pg.trunk, patchFoliage(new THREE.MeshStandardMaterial({ color: 0x9a7a58, roughness: 0.95 }), 0.35, false), this.palms.length);
+      const fm = new THREE.InstancedMesh(pg.fronds, patchFoliage(new THREE.MeshStandardMaterial({ map: frondTexture(), alphaTest: 0.45, side: THREE.DoubleSide, roughness: 0.75, color: 0xffffff }), 1.8, false), this.palms.length);
+      this.palms.forEach((p, idx) => { d.position.set(p.x, 0.1, p.z); d.rotation.set(0, idx * 1.9, 0); d.scale.setScalar(0.9 + (idx % 4) * 0.1); d.updateMatrix(); pm.setMatrixAt(idx, d.matrix); fm.setMatrixAt(idx, d.matrix); });
+      d.scale.setScalar(1);
       pm.castShadow = fm.castShadow = true;
+      fm.receiveShadow = true;
       this.group.add(pm, fm);
     }
     // benches
@@ -761,12 +828,8 @@ export class World {
 
   // ---------------------------------------------------------------- sea / surroundings
   private buildSea() {
-    const wn = waterNormal();
-    wn.repeat.set(60, 60);
-    const mat = new THREE.MeshPhongMaterial({ color: 0x0a4a66, specular: 0xa8c8e8, shininess: 180, normalMap: wn, normalScale: new THREE.Vector2(0.8, 0.8), transparent: true, opacity: 0.93 });
-    const sea = new THREE.Mesh(new THREE.PlaneGeometry(3000, 3000), mat);
-    sea.rotation.x = -Math.PI / 2;
-    sea.position.set(HALF + 60 + 1500, -0.6, 0);
+    const sea = createWater(waterNormal(), HALF + 63, 3000, HALF + 30 + 1500);
+    sea.position.y = -0.45;
     this.group.add(sea);
     this.sea = sea;
     // sand slope between road and sea
@@ -781,13 +844,13 @@ export class World {
 
   private buildSurroundings() {
     const rng = this.rng;
-    // distant hills
-    const mat = new THREE.MeshStandardMaterial({ color: 0x4a5a46, roughness: 1, flatShading: true });
+    // distant mountains: displaced, strata-coloured ridges that fade into the haze
+    const mat = new THREE.MeshStandardMaterial({ vertexColors: true, roughness: 1 });
     for (let k = 0; k < 26; k++) {
       const a = (k / 26) * Math.PI * 2;
       if (Math.cos(a) > 0.55) continue;
       const r = 1100 + rng() * 300;
-      const g = new THREE.ConeGeometry(160 + rng() * 220, 120 + rng() * 260, 6 + Math.floor(rng() * 3));
+      const g = makeMountainGeometry(rng, 170 + rng() * 230, 130 + rng() * 280);
       const m = new THREE.Mesh(g, mat);
       m.position.set(Math.cos(a) * r, 40, Math.sin(a) * r);
       m.rotation.y = rng() * 3;
@@ -1021,12 +1084,16 @@ export class World {
     return { x: pos + (dirPos ? off : -off), z: t, h: dirPos ? 0 : Math.PI };
   }
 
+  updateSea(sky: Sky, t: number) { updateWater(this.sea, sky, t); }
+
   // ---------------------------------------------------------------- per-frame
   update(dt: number, t: number, focus: THREE.Vector3, night: number) {
     this.nightF = night;
-    { const nm = (this.sea.material as THREE.MeshPhongMaterial).normalMap; if (nm) { nm.offset.x += dt * 0.004; nm.offset.y += dt * 0.0025; } }
+    windUniform.value = t;
     for (const m of this.facadeMats) m.emissiveIntensity = night * 0.85;
-    this.lampMat.emissiveIntensity = night * 1.8;
+    this.lampMat.emissiveIntensity = night * 2.2;
+    (this.glow.material as THREE.PointsMaterial).opacity = Math.min(1, night * 1.1) * 0.55;
+    if (this.aviation) (this.aviation.material as THREE.PointsMaterial).opacity = Math.min(1, night * 1.6 + 0.1) * (Math.sin(t * 2.6) > 0.15 ? 0.95 : 0.12);
     for (const m of this.signMats) m.emissiveIntensity = 0.35 + night * 0.9;
     if (Math.floor(t * 2) !== Math.floor((t - dt) * 2)) this.updateSignals(t);
     // assign pooled lights to nearest lamps

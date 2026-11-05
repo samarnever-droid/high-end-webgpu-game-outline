@@ -5,6 +5,8 @@ import { UnrealBloomPass } from 'three/examples/jsm/postprocessing/UnrealBloomPa
 import { ShaderPass } from 'three/examples/jsm/postprocessing/ShaderPass.js';
 import { OutputPass } from 'three/examples/jsm/postprocessing/OutputPass.js';
 import { SMAAPass } from 'three/examples/jsm/postprocessing/SMAAPass.js';
+import { UberPass } from './post';
+import { wetUniform } from './wet';
 import { AudioEngine, STATIONS } from './audio';
 import { Crowd, Npc, Police, Traffic } from './ai';
 import { FX } from './fx';
@@ -60,6 +62,12 @@ export class Game {
   bloom!: UnrealBloomPass;
   grade!: ShaderPass;
   smaa?: SMAAPass;
+  uber!: UberPass;
+  wetness = 0;
+  resScale = 1;
+  perfT = 0; perfAcc = 0; perfN = 0;
+  weatherT = 90;
+  flash = 0;
   sky!: Sky;
   fx!: FX;
   world!: World;
@@ -147,11 +155,12 @@ export class Game {
     progress('Starting renderer…', 0.02);
     await tick();
     const renderer = new THREE.WebGLRenderer({ canvas: this.canvas, antialias: false, powerPreference: 'high-performance' });
-    renderer.setPixelRatio(Math.min(window.devicePixelRatio, 1.5));
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
     renderer.shadowMap.enabled = true;
     renderer.shadowMap.type = THREE.PCFSoftShadowMap;
     renderer.toneMapping = THREE.ACESFilmicToneMapping;
     renderer.toneMappingExposure = 1;
+    renderer.shadowMap.autoUpdate = true;
     this.renderer = renderer;
     this.sky = new Sky(renderer, this.scene);
     this.fx = new FX();
@@ -252,13 +261,36 @@ export class Game {
     const size = new THREE.Vector2();
     this.renderer.getSize(size);
     const rt = new THREE.WebGLRenderTarget(size.x, size.y, { type: THREE.HalfFloatType, samples: 4 });
+    rt.depthTexture = new THREE.DepthTexture(size.x, size.y);
     this.composer = new EffectComposer(this.renderer, rt);
     this.composer.addPass(new RenderPass(this.scene, this.camera));
+    this.uber = new UberPass(this.camera, size.x, size.y);
+    this.composer.addPass(this.uber);
     this.bloom = new UnrealBloomPass(new THREE.Vector2(size.x, size.y), 0.3, 0.6, 1.15);
     this.composer.addPass(this.bloom);
     this.grade = new ShaderPass(GRADE);
     this.composer.addPass(this.grade);
     this.composer.addPass(new OutputPass());
+  }
+
+  /** Dynamic resolution: keeps the frame-rate smooth by trading pixel density for speed. */
+  private adaptResolution(rawDt: number) {
+    this.perfAcc += rawDt; this.perfN++;
+    if (this.perfAcc < 1.2) return;
+    const fps = this.perfN / this.perfAcc;
+    this.perfAcc = 0; this.perfN = 0;
+    if (hud.phase === 'loading') return;
+    const maxScale = 1;
+    let next = this.resScale;
+    if (fps < 40) next = Math.max(0.55, this.resScale - 0.1);
+    else if (fps > 57) next = Math.min(maxScale, this.resScale + 0.05);
+    if (Math.abs(next - this.resScale) > 0.001) {
+      this.resScale = next;
+      const pr = Math.min(window.devicePixelRatio, 2) * next;
+      this.renderer.setPixelRatio(pr);
+      this.composer.setPixelRatio(pr);
+      this.resize();
+    }
   }
 
   resize = () => {
@@ -438,6 +470,7 @@ export class Game {
       this.update(dt);
     }
     this.render(dt);
+    this.adaptResolution(rawDt);
     this.keyPressed.clear();
     this.mouseDx = 0; this.mouseDy = 0; this.wheel = 0;
   };
@@ -449,7 +482,32 @@ export class Game {
     this.grade.uniforms.uDamage.value = clamp(hud.damage, 0, 1) + (this.player.hp < 30 ? (30 - this.player.hp) / 60 : 0);
     this.grade.uniforms.uAim.value = hud.aiming ? 1 : 0;
     this.bloom.enabled = hud.settings.bloom;
-    this.bloom.strength = 0.12 + this.sky.night * 0.22;
+    this.bloom.strength = 0.14 + this.sky.night * 0.26 + this.sky.lightning * 0.5;
+    this.bloom.threshold = 1.0 - this.sky.night * 0.15;
+
+    // ---- atmosphere / post feed
+    const sk = this.sky, u = this.uber, st = hud.settings;
+    const q = st.quality === 'high';
+    u.settings.ao = st.ao && q;
+    u.settings.ssr = st.reflections && q;
+    u.settings.rays = st.rays;
+    u.settings.flare = st.rays;
+    u.settings.fog = st.volumetrics;
+    u.sunDir.copy(sk.sunDir);
+    u.sunCol.copy(sk.sun.color);
+    u.fogCol.copy(sk.fog.color);
+    const dayK = sk.day;
+    u.fogDensity = (0.0007 + (1 - dayK) * 0.0012 + sk.rain * 0.0034) * (st.volumetrics ? 1 : 0);
+    u.fogHeight = 0.022 + sk.rain * 0.01;
+    const sunUp = Math.max(0, sk.sunDir.y);
+    u.raysAmount = clamp(sunUp * 2.2, 0, 1) * (1 - sk.rain * 0.85) * dayK * (sk.sunDir.y < 0.25 ? 1.35 : 1);
+    u.flareAmount = clamp(sunUp * 3, 0, 1) * (1 - sk.rain) * dayK;
+    this.wetness += (Math.min(1, sk.rain * 1.6) - this.wetness) * (1 - Math.exp(-dt * (sk.rain > this.wetness ? 0.5 : 0.03)));
+    wetUniform.value = this.wetness;
+    u.wet = this.wetness;
+    u.indoor = sk.indoor;
+    u.time = this.time;
+    sk.autoWeather = st.autoWeather && this.state === 'play';
     this.composer.render(dt);
   }
 
@@ -464,6 +522,7 @@ export class Game {
     this.updateCamera(dt);
     this.sky.update(dt, hud.phase === 'playing' ? hud.settings.timeScale * 6 : 2, this.focus(), this.camera);
     this.world.update(dt, this.time, this.focus(), this.sky.night);
+    this.world.updateSea(this.sky, this.time);
     this.interiors.update(dt);
     this.fx.update(dt, this.renderer.domElement.height * 0.5);
     this.updateAudio(dt);

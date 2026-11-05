@@ -19,7 +19,7 @@ export interface HudState {
   fullMap: boolean; phone: boolean; shop: { id: string; title: string; sub: string; items: ShopItem[] } | null;
   overlay: null | 'wasted' | 'busted' | 'passed' | 'failed' | 'ending'; overlayText: string;
   fade: boolean; cinematic: boolean; aiming: boolean; hitMarker: number; damage: number; locked: boolean;
-  settings: { volume: number; music: number; shadows: boolean; bloom: boolean; sens: number; timeScale: number; quality: 'low' | 'high' };
+  settings: { volume: number; music: number; shadows: boolean; bloom: boolean; ao: boolean; reflections: boolean; rays: boolean; volumetrics: boolean; autoWeather: boolean; sens: number; timeScale: number; quality: 'low' | 'high' };
   missions: { id: number; title: string; done: boolean; active: boolean }[];
   hint: string | null;
   fps: number;
@@ -42,7 +42,7 @@ export const hud: HudState = {
   clock: '12:00', radio: 'Radio Off', weather: 'clear',
   fullMap: false, phone: false, shop: null,
   overlay: null, overlayText: '', fade: false, cinematic: false, aiming: false, hitMarker: 0, damage: 0, locked: false,
-  settings: { volume: 0.7, music: 0.6, shadows: true, bloom: true, sens: 1, timeScale: 1, quality: 'high' },
+  settings: { volume: 0.7, music: 0.6, shadows: true, bloom: true, ao: true, reflections: true, rays: true, volumetrics: true, autoWeather: true, sens: 1, timeScale: 1, quality: 'high' },
   missions: [], hint: null, fps: 60,
   style: { rank: 'D', mult: 1, pct: 0, bank: 0, label: '', labelId: 0, active: false, chainT: 0 },
   rep: { level: 1, xp: 0, need: 250 },

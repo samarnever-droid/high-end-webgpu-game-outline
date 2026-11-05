@@ -23,6 +23,7 @@ uniform float uRain;
 uniform vec3 uZenith;
 uniform vec3 uHorizon;
 uniform vec3 uSunCol;
+uniform float uFlash;
 
 float hash(vec2 p){ return fract(sin(dot(p, vec2(127.1,311.7))) * 43758.5453); }
 float hash3(vec3 p){ return fract(sin(dot(p, vec3(127.1,311.7,74.7))) * 43758.5453); }
@@ -43,7 +44,7 @@ void main(){
   vec3 col = mix(uHorizon, uZenith, t);
   // sun glow & disc
   float sd = max(dot(d, uSun), 0.0);
-  col += uSunCol * (pow(sd, 6.0) * 0.22 + pow(sd, 120.0) * 0.45) * uDay;
+  col += uSunCol * (pow(sd, 3.0) * 0.1 + pow(sd, 8.0) * 0.16 + pow(sd, 120.0) * 0.45) * uDay;
   col += uSunCol * pow(sd, 1500.0) * 3.0 * uDay;
   // horizon haze band
   col = mix(col, uHorizon * 1.05, pow(1.0 - clamp(abs(d.y)*2.2,0.0,1.0), 3.0) * 0.5);
@@ -63,18 +64,28 @@ void main(){
     float mw = fbm(d.xz*6.0 + d.y*3.0) * smoothstep(0.7, 0.0, abs(d.x*0.6 + d.z*0.3 - d.y*0.2));
     col += vec3(0.25,0.3,0.45) * mw * 0.25 * uNight;
   }
-  // clouds
-  if (d.y > 0.02) {
-    vec2 uv = d.xz / (d.y + 0.15) * 1.4 + vec2(uTime*0.004, uTime*0.0015);
+  // clouds: self-shadowed layer with sun-lit edges + high cirrus
+  if (d.y > 0.012) {
+    vec2 uv = d.xz / (d.y + 0.12) * 1.3 + vec2(uTime*0.004, uTime*0.0015);
     float c = fbm(uv * 1.3);
-    float cov = mix(0.52, 0.28, uCloud);
-    float m = smoothstep(cov, cov + 0.22, c) * smoothstep(0.02, 0.25, d.y);
-    float shade = fbm(uv * 1.3 + uSun.xz * 0.15);
-    vec3 cc = mix(vec3(0.55,0.58,0.65), vec3(1.0,0.98,0.95), clamp(1.2 - shade, 0.0, 1.0));
-    cc *= mix(vec3(0.07,0.09,0.15) * 1.2, mix(vec3(1.0), uSunCol, 0.35), uDay);
-    cc = mix(cc, cc * 0.45, uRain);
-    col = mix(col, cc, m * (0.9 + uRain * 0.1));
+    float cov = mix(0.5, 0.26, uCloud);
+    float dens = smoothstep(cov, cov + 0.24, c);
+    float hf = smoothstep(0.012, 0.2, d.y);
+    vec2 toSun = normalize(uSun.xz + vec2(1e-4)) * 0.07;
+    float c2 = fbm((uv + toSun) * 1.3);
+    float thick = clamp((c - cov) * 3.0, 0.0, 1.0);
+    float lit = clamp(1.0 - (c2 - c) * 4.0, 0.0, 1.5);
+    vec3 cc = mix(vec3(0.40,0.44,0.54), vec3(1.0), clamp(lit * 0.65 + (1.0 - thick) * 0.45, 0.0, 1.0));
+    float sd2 = pow(max(dot(d, uSun), 0.0), 8.0);
+    cc += uSunCol * sd2 * (1.0 - thick * 0.6) * 0.9;
+    cc *= mix(vec3(0.07,0.09,0.15) * 1.2, mix(vec3(1.0), uSunCol, 0.5), uDay);
+    cc = mix(cc, cc * 0.42, uRain);
+    cc += vec3(0.55, 0.65, 1.0) * uFlash * (0.4 + thick);
+    col = mix(col, cc, dens * hf * 0.93);
+    float ci = fbm(vec2(d.x * 5.0 + uTime * 0.002, d.z * 20.0 + d.y * 4.0));
+    col += uSunCol * smoothstep(0.55, 0.88, ci) * 0.13 * uDay * (1.0 - dens) * smoothstep(0.05, 0.4, d.y) * (1.0 - uCloud);
   }
+  col += vec3(0.5, 0.6, 1.0) * uFlash * 0.25;
   // below horizon: ground fog colour
   if (d.y < 0.0) col = mix(uHorizon, uHorizon*0.6, clamp(-d.y*4.0,0.0,1.0));
   gl_FragColor = vec4(col, 1.0);
@@ -95,6 +106,10 @@ export class Sky {
   night = 0;
   day = 1;
   indoor = 0;
+  lightning = 0;
+  autoWeather = false;
+  private weatherT = 100;
+  private strikeT = 4;
   sunDir = new THREE.Vector3();
   private envScene = new THREE.Scene();
   private pmrem: THREE.PMREMGenerator;
@@ -110,7 +125,7 @@ export class Sky {
       vertexShader: vert, fragmentShader: frag, side: THREE.BackSide, depthWrite: false, depthTest: false,
       uniforms: {
         uSun: { value: new THREE.Vector3(0, 1, 0) }, uMoon: { value: new THREE.Vector3(0, -1, 0) }, uDay: { value: 1 }, uNight: { value: 0 }, uTime: { value: 0 },
-        uCloud: { value: 0.3 }, uRain: { value: 0 }, uZenith: { value: new THREE.Color() }, uHorizon: { value: new THREE.Color() }, uSunCol: { value: new THREE.Color() },
+        uCloud: { value: 0.3 }, uRain: { value: 0 }, uFlash: { value: 0 }, uZenith: { value: new THREE.Color() }, uHorizon: { value: new THREE.Color() }, uSunCol: { value: new THREE.Color() },
       },
     });
     this.dome = new THREE.Mesh(new THREE.SphereGeometry(900, 32, 20), this.mat);
@@ -121,11 +136,11 @@ export class Sky {
 
     this.sun = new THREE.DirectionalLight(0xfff0dd, 3);
     this.sun.castShadow = true;
-    this.sun.shadow.mapSize.set(2048, 2048);
+    this.sun.shadow.mapSize.set(3072, 3072);
     const sc = this.sun.shadow.camera;
-    sc.left = -90; sc.right = 90; sc.top = 90; sc.bottom = -90; sc.near = 1; sc.far = 500;
-    this.sun.shadow.bias = -0.0003;
-    this.sun.shadow.normalBias = 0.06;
+    sc.left = -100; sc.right = 100; sc.top = 100; sc.bottom = -100; sc.near = 1; sc.far = 500;
+    this.sun.shadow.bias = -0.00025;
+    this.sun.shadow.normalBias = 0.05;
     scene.add(this.sun, this.sun.target);
     this.moon = new THREE.DirectionalLight(0x6a88d0, 0);
     scene.add(this.moon);
@@ -188,6 +203,7 @@ export class Sky {
     u.uNight.value = this.night;
     u.uCloud.value = clamp(this.cloud + this.rain, 0, 1);
     u.uRain.value = this.rain;
+    u.uFlash.value = this.lightning;
     u.uZenith.value.copy(zen);
     u.uHorizon.value.copy(hor);
     u.uSunCol.value.copy(sunCol);
@@ -198,11 +214,11 @@ export class Sky {
     this.moon.intensity = this.night * 0.55 * (1 - this.rain * 0.5);
     this.moon.position.set(-this.sunDir.x * 200, Math.max(30, -this.sunDir.y * 200), 80);
     const ind = 1 - 0.72 * this.indoor;
-    this.hemi.intensity = (0.28 + dayK * 0.42) * ind;
+    this.hemi.intensity = (0.28 + dayK * 0.42) * ind + this.lightning * 4;
     this.hemi.color.copy(zen).lerp(new THREE.Color(1, 1, 1), 0.35);
     this.hemi.groundColor.set(0x3a362f).multiplyScalar(0.3 + dayK * 0.8);
     this.fog.color.copy(hor);
-    this.fog.density = lerp(0.0007, 0.0024, this.rain) + (1 - dayK) * 0.0004;
+    this.fog.density = lerp(0.00045, 0.0014, this.rain) + (1 - dayK) * 0.0003;
     this.renderer.toneMappingExposure = lerp(1.05, 0.78, dayK) * (1 - this.rain * 0.1);
     if (force || Math.abs(this.hour - this.lastEnvHour) > 0.35) {
       this.lastEnvHour = this.hour;
@@ -220,10 +236,23 @@ export class Sky {
     this.hour = (this.hour + (dt * timeScale) / 60) % 24;
     this.rain += (this.rainTarget - this.rain) * (1 - Math.exp(-dt * 0.25));
     this.mat.uniforms.uTime.value += dt;
+    if (this.autoWeather) {
+      this.weatherT -= dt;
+      if (this.weatherT <= 0) {
+        this.weatherT = 80 + Math.random() * 120;
+        this.rainTarget = this.rainTarget > 0.05 ? 0 : (Math.random() < 0.5 ? 0.45 + Math.random() * 0.55 : 0);
+      }
+    }
+    // thunderstorms
+    this.lightning = Math.max(0, this.lightning - dt * (this.lightning > 0.5 ? 3 : 1.6));
+    if (this.rain > 0.65) {
+      this.strikeT -= dt;
+      if (this.strikeT <= 0) { this.strikeT = 5 + Math.random() * 14; this.lightning = 1; setTimeout(() => { if (this.rain > 0.5) this.lightning = Math.max(this.lightning, 0.7); }, 140); }
+    }
     this.apply();
     this.dome.position.copy(cam.position);
     // sun shadow follows the focus, snapped to texels
-    const snap = 180 / 2048;
+    const snap = 200 / 3072;
     const fx = Math.round(focus.x / snap) * snap, fz = Math.round(focus.z / snap) * snap;
     this.sun.target.position.set(fx, 0, fz);
     this.sun.position.set(fx + this.sunDir.x * 220, this.sunDir.y * 220 + 10, fz + this.sunDir.z * 220);

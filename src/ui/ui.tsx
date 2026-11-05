@@ -251,13 +251,19 @@ export function PauseMenu({ game }: { game: Game }) {
     <div className="absolute inset-0 z-40 flex items-center justify-center bg-black/70 text-white backdrop-blur-sm" style={{ fontFamily: 'system-ui, sans-serif' }}>
       <div className="w-[480px] rounded-2xl border border-white/10 bg-zinc-950/90 p-8">
         <div className="text-3xl" style={font}>PAUSED</div>
-        <div className="mt-6 space-y-4 text-sm">
+        <div className="mt-6 max-h-[60vh] space-y-3 overflow-y-auto pr-2 text-sm">
           <Slider label="Master volume" v={s.volume} on={(v) => set({ volume: v })} />
           <Slider label="Radio volume" v={s.music} on={(v) => set({ music: v })} />
           <Slider label="Mouse sensitivity" v={s.sens / 2} on={(v) => set({ sens: v * 2 })} />
           <Slider label="Time speed" v={s.timeScale / 4} on={(v) => set({ timeScale: Math.max(0.1, v * 4) })} />
           <Toggle label="Shadows" v={s.shadows} on={(v) => set({ shadows: v })} />
           <Toggle label="Bloom & post-processing" v={s.bloom} on={(v) => set({ bloom: v })} />
+          <Toggle label="Ambient occlusion (SSAO)" v={s.ao} on={(v) => set({ ao: v })} />
+          <Toggle label="Wet-road reflections (SSR)" v={s.reflections} on={(v) => set({ reflections: v })} />
+          <Toggle label="God rays & lens flare" v={s.rays} on={(v) => set({ rays: v })} />
+          <Toggle label="Volumetric fog" v={s.volumetrics} on={(v) => set({ volumetrics: v })} />
+          <Toggle label="Dynamic weather" v={s.autoWeather} on={(v) => set({ autoWeather: v })} />
+          <Toggle label="Ultra quality (AO + SSR)" v={s.quality === 'high'} on={(v) => set({ quality: v ? 'high' : 'low' })} />
         </div>
         <div className="mt-8 flex gap-3">
           <button className="flex-1 rounded-md bg-gradient-to-r from-fuchsia-500 to-cyan-500 py-2.5 font-bold" onClick={() => game.togglePause()}>Resume</button>
