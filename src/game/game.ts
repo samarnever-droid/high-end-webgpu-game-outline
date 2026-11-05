@@ -1,1190 +1,1812 @@
-import * as THREE from 'three/webgpu';
-import { pass, screenUV, vec4, float, uniform } from 'three/tsl';
-import { bloom } from 'three/addons/tsl/display/BloomNode.js';
-import { AudioEngine } from './audio';
-import { buildCity, c, type City, type Hit } from './city';
-import { Humanoid, VEER, DEV, JIMMY, MEERA, type HumanoidOptions } from './character';
-import { CarEntity } from './vehicle';
-import { Traffic, Peds } from './traffic';
-import { Sparks, Marker } from './fx';
-import { makeSky, SUN_DIR } from './sky';
-import { MISSIONS, SPAWN, type Line, type Respawn } from './missions';
-import { Merger, M4, angDiff, clamp, makeCanvas, mulberry32 } from './geo';
+import * as THREE from 'three';
+import { EffectComposer } from 'three/examples/jsm/postprocessing/EffectComposer.js';
+import { RenderPass } from 'three/examples/jsm/postprocessing/RenderPass.js';
+import { UnrealBloomPass } from 'three/examples/jsm/postprocessing/UnrealBloomPass.js';
+import { ShaderPass } from 'three/examples/jsm/postprocessing/ShaderPass.js';
+import { OutputPass } from 'three/examples/jsm/postprocessing/OutputPass.js';
+import { SMAAPass } from 'three/examples/jsm/postprocessing/SMAAPass.js';
+import { AudioEngine, STATIONS } from './audio';
+import { Crowd, Npc, Police, Traffic } from './ai';
+import { FX } from './fx';
+import { Human, LOOKS, defaultState, type HumanState, type Look } from './humanoid';
+import { MISSIONS, MissionFail, setupStory } from './story';
+import { hud, emitHud } from './store';
+import { Sky } from './sky';
+import { Vehicle, noControl } from './vehicle';
+import { WEAPONS, WEAPON_ORDER, buildWeaponModel, type WeaponDef, type WeaponId, type WeaponModel } from './weapons';
+import { HALF, World, nodePos, type Hit } from './world';
+import { angDiff, clamp, damp, dampAngle, fmtMoney } from './util';
+import type { CarKind } from './carmodels';
 
-export interface HudState {
-  phase: 'loading' | 'menu' | 'playing';
-  speed: number;
-  inCar: boolean;
-  nitro: number;
-  mission: { n: number; total: number; title: string; tag: string } | null;
-  objective: string | null;
-  distance: number | null;
-  timer: number | null;
-  timerLabel: string;
-  cash: number;
-  subtitle: { who: string; text: string } | null;
-  prompt: string | null;
-  toast: { title: string; sub: string; kind: 'pass' | 'fail' | 'info' | 'flash' } | null;
-  lost: number | null;
-  cp: { i: number; n: number } | null;
-  muted: boolean;
-  musicOn: boolean;
-  fade: boolean;
-  ended: boolean;
-  fps: number;
-  res: number;
-  locked: boolean;
-}
+export interface Marker { x: number; z: number; color?: string; r?: number; label?: string; blip?: boolean; gps?: boolean }
+interface Cash { mesh: THREE.Mesh; x: number; z: number; amt: number; t: number }
+interface Proj { mesh: THREE.Mesh; p: THREE.Vector3; v: THREE.Vector3; life: number; from: 'player' | 'npc' }
+interface Waiter { cond: () => boolean; resolve: () => void; reject: (e: unknown) => void }
+export interface RayHit { t: number; kind: 'none' | 'world' | 'ground' | 'npc' | 'vehicle'; npc?: Npc; veh?: Vehicle; head?: boolean; nx: number; ny: number; nz: number }
 
-export interface GameCallbacks {
-  onHud: (h: HudState) => void;
-  onProgress?: (t: string) => void;
-}
+const GRADE = {
+  uniforms: { tDiffuse: { value: null as THREE.Texture | null }, uTime: { value: 0 }, uVig: { value: 1.0 }, uDamage: { value: 0 }, uSpeed: { value: 0 }, uSat: { value: 1.08 }, uAim: { value: 0 } },
+  vertexShader: 'varying vec2 vUv; void main(){ vUv = uv; gl_Position = projectionMatrix * modelViewMatrix * vec4(position,1.0); }',
+  fragmentShader: /* glsl */ `
+  uniform sampler2D tDiffuse; uniform float uTime, uVig, uDamage, uSpeed, uSat, uAim; varying vec2 vUv;
+  float h(vec2 p){ return fract(sin(dot(p, vec2(12.9898,78.233))) * 43758.5453); }
+  void main(){
+    vec2 c = vUv - 0.5; float r = dot(c,c);
+    float ca = 0.0008 + r * 0.006 + uSpeed * 0.004;
+    vec3 col = vec3(texture2D(tDiffuse, vUv + c*ca).r, texture2D(tDiffuse, vUv).g, texture2D(tDiffuse, vUv - c*ca).b);
+    if (uSpeed > 0.02) { vec3 acc = col; for (int i=1;i<6;i++){ acc += texture2D(tDiffuse, vUv - c * float(i) * 0.012 * uSpeed).rgb; } col = mix(col, acc/6.0, clamp(r*3.0,0.0,1.0)*uSpeed); }
+    col *= 1.0 - r * uVig * (1.0 + uAim*0.5);
+    col = mix(col, col * vec3(1.5,0.25,0.25), uDamage * smoothstep(0.05, 0.5, r*2.0));
+    float l = dot(col, vec3(0.299,0.587,0.114));
+    col = mix(vec3(l), col, uSat);
+    vec3 shadowT = vec3(0.92,1.0,1.1), highT = vec3(1.06,1.0,0.92);
+    col *= mix(shadowT, highT, smoothstep(0.1, 0.9, l));
+    col += (h(vUv*vec2(1920.0,1080.0) + uTime) - 0.5) * 0.02;
+    gl_FragColor = vec4(col, 1.0);
+  }`,
+};
 
-interface MarkerSpec { x: number; z: number; r?: number; color?: string }
-interface Npc { h: Humanoid; x: number; z: number; on: boolean }
-
-const NPC_DEFS: Record<string, HumanoidOptions> = { dev: DEV, jimmy: JIMMY, meera: MEERA };
+const MAPW = 1240;
 
 export class Game {
-  state: 'loading' | 'menu' | 'playing' = 'loading';
+  // core
+  canvas: HTMLCanvasElement;
+  renderer!: THREE.WebGLRenderer;
+  scene = new THREE.Scene();
+  camera = new THREE.PerspectiveCamera(62, 1, 0.12, 2500);
+  composer!: EffectComposer;
+  bloom!: UnrealBloomPass;
+  grade!: ShaderPass;
+  smaa?: SMAAPass;
+  sky!: Sky;
+  fx!: FX;
+  world!: World;
   audio = new AudioEngine();
-
-  // exposed to missions
-  inCar = false;
-  px = SPAWN.x; py = 0; pz = SPAWN.z;
-  car!: CarEntity;
-  target: CarEntity | null = null;
-  targetGo = false;
-  targetArrived = false;
-
-  private renderer!: THREE.WebGPURenderer;
-  private scene = new THREE.Scene();
-  private camera = new THREE.PerspectiveCamera(62, 1, 0.3, 2600);
-  private pipeline: THREE.RenderPipeline | null = null;
-  private boostU = uniform(0);
-  private sun!: THREE.DirectionalLight;
-  private city!: City;
-  private veer!: Humanoid;
-  private npcs: Record<string, Npc> = {};
-  private traffic!: Traffic;
-  private peds!: Peds;
-  private sparks = new Sparks();
-  private markerObjs: Marker[] = [new Marker(), new Marker(), new Marker()];
-  private markers: MarkerSpec[] = [];
-  private boat = new THREE.Group();
-  private mapCanvas!: HTMLCanvasElement;
-  private disposed = false;
-
-  // input
-  private keys = new Set<string>();
-  private jumpPressed = false;
-  private hornOn = false;
-  private lastMouse = 0;
-  private dragging = false;
+  crowd!: Crowd;
+  traffic!: Traffic;
+  police!: Police;
+  hud = hud;
+  tmpHit: Hit = { x: 0, z: 0, nx: 0, nz: 0, hit: false };
+  time = 0;
+  paused = false;
+  disposed = false;
+  vehicles: Vehicle[] = [];
+  npcs: Npc[] = [];
+  flags: Record<string, unknown> = {};
 
   // player
-  private pvx = 0; private pvz = 0; private pvy = 0;
-  private pheading = Math.PI / 2;
-  private pgrounded = true;
-  private steerSm = 0;
-  private carVisible = false;
+  playerHuman!: Human;
+  playerHs: HumanState = defaultState();
+  player = { x: 0, y: 0, z: 0, vy: 0, heading: 0, vx: 0, vz: 0, hp: 100, armor: 0, cash: 800, vehicle: null as Vehicle | null, crouch: false, onGround: true, aim: false };
+  inv: Record<string, { have: boolean; mag: number; reserve: number }> = {};
+  weapon: WeaponId = 'pistol';
+  wm: WeaponModel | null = null;
+  reloadT = 0; fireT = 0; meleeT = 0; meleeHit = false; lastShot = -9; lastDamage = -9;
+  wanted = 0;
+  lastCar: Vehicle | null = null;
+  ownedCars: string[] = [];
 
-  // camera
-  private camYaw = Math.PI / 2;
-  private camPitch = 0.22;
-  private camT = new THREE.Vector3();
-  private camInit = false;
-  private fov = 62;
-  private shake = 0;
+  // input
+  keys = new Set<string>();
+  keyPressed = new Set<string>();
+  mouseDx = 0; mouseDy = 0; mouseDown = false; rmb = false; wheel = 0;
+  camYaw = 0; camPitch = 0.25; camDist = 4.4; camLookT = 0;
+  camPos = new THREE.Vector3(); camShake = 0;
+  fov = 62;
 
-  // mission state
-  private mi = 0;
-  private si = 0;
-  private missionActive = false;
-  private failing = false;
-  private failFlag = false;
-  private timer: { t: number; label: string } | null = null;
-  private lost: number | null = null;
-  private cp: { i: number; n: number } | null = null;
-  private objective: string | null = null;
-  private tpts: { x: number; z: number }[] = [];
-  private tidx = 0;
-  private cash = 0;
+  // misc systems
+  pickups: Cash[] = [];
+  projs: Proj[] = [];
+  markers: Marker[] = [];
+  beacons: THREE.Mesh[] = [];
+  waiters: Waiter[] = [];
+  mapCanvas!: HTMLCanvasElement;
+  miniCanvas: HTMLCanvasElement | null = null;
+  bigCanvas: HTMLCanvasElement | null = null;
+  routePts: { x: number; z: number }[] = [];
+  routeT = 0;
+  state: 'menu' | 'play' | 'dead' | 'busted' | 'cinematic' = 'menu';
+  menuT = 0;
+  slowmo = 1;
+  dialogueAdvance: (() => void) | null = null;
+  dialogueChoose: ((i: number) => void) | null = null;
+  dialogNpc: Npc | null = null;
+  talkCam = 0;
+  missionIndex = 0;
+  missionRunning = false;
+  missionAbort: { reason: string } | null = null;
+  missionTimer: { t: number; label: string; onEnd?: () => void } | null = null;
+  completed = new Set<number>();
+  story: ReturnType<typeof setupStory> | null = null;
+  subtitleT = 0;
+  hudT = 0; mapT = 0; fpsAcc = 0; fpsN = 0;
+  toastId = 1;
+  interact: { kind: 'npc' | 'poi' | 'veh' | 'none'; npc?: Npc; poi?: string; veh?: Vehicle } = { kind: 'none' };
+  respawnT = 0;
+  stepAcc = 0;
+  distAcc = 0;
+  carryOver = 0;
+  rainOn = false;
+  cinematicCam: { from: THREE.Vector3; to: THREE.Vector3; look: THREE.Vector3; t: number; dur: number } | null = null;
 
-  // dialogue
-  private queue: Line[] = [];
-  private curLine: Line | null = null;
-  private lineT = 0;
-
-  private later: { t: number; fn: () => void }[] = [];
-  private hud: HudState;
-  private lastEmit = 0;
-  private toastT = 0;
-  private time = 0;
-  private last = performance.now();
-  private fpsAcc = 0;
-  private fpsN = 0;
-  private fps = 60;
-  private res = 1;
-  private maxRes = 1.5;
-  private adaptT = 0;
-  private hit: Hit = { x: 0, z: 0, nx: 0, nz: 0, hit: false };
-  private menuAngle = 0;
-  private resize = () => this.onResize();
-
-  constructor(private container: HTMLElement, private mini: HTMLCanvasElement, private cb: GameCallbacks) {
-    this.hud = {
-      phase: 'loading', speed: 0, inCar: false, nitro: 1, mission: null, objective: null, distance: null,
-      timer: null, timerLabel: '', cash: 0, subtitle: null, prompt: null, toast: null, lost: null, cp: null,
-      muted: false, musicOn: true, fade: false, ended: false, fps: 60, res: 1, locked: false,
-    };
+  constructor(canvas: HTMLCanvasElement) {
+    this.canvas = canvas;
   }
 
-  // =================================================================== init
-  async init() {
-    const say = (t: string) => this.cb.onProgress?.(t);
-    this.maxRes = Math.min(window.devicePixelRatio || 1, 1.6);
-    this.res = this.maxRes;
-    const renderer = new THREE.WebGPURenderer({ antialias: true, powerPreference: 'high-performance' });
-    this.renderer = renderer;
-    renderer.setPixelRatio(this.res);
-    const w = this.container.clientWidth || window.innerWidth;
-    const h = this.container.clientHeight || window.innerHeight;
-    renderer.setSize(w, h);
-    renderer.toneMapping = THREE.ACESFilmicToneMapping;
-    renderer.toneMappingExposure = 0.95;
+  // =================================================================== boot
+  async init(progress: (msg: string, pct: number) => void) {
+    const tick = () => new Promise<void>((r) => setTimeout(r, 16));
+    progress('Starting renderer…', 0.02);
+    await tick();
+    const renderer = new THREE.WebGLRenderer({ canvas: this.canvas, antialias: false, powerPreference: 'high-performance' });
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio, 1.5));
     renderer.shadowMap.enabled = true;
-    const el = renderer.domElement;
-    el.style.cssText = 'position:absolute;inset:0;width:100%;height:100%;display:block;outline:none';
-    this.container.appendChild(el);
-    say('WebGPU device shuru ho raha hai...');
-    await renderer.init();
-    if (this.disposed) return;
-    if (!(renderer as unknown as { backend: { isWebGPUBackend?: boolean } }).backend.isWebGPUBackend) {
-      throw new Error('NO_WEBGPU');
+    renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+    renderer.toneMapping = THREE.ACESFilmicToneMapping;
+    renderer.toneMappingExposure = 1;
+    this.renderer = renderer;
+    this.sky = new Sky(renderer, this.scene);
+    this.fx = new FX();
+    this.scene.add(this.fx.group);
+    progress('Rendering the sky…', 0.08);
+    await tick();
+
+    progress('Pouring asphalt & raising skyscrapers…', 0.12);
+    await tick();
+    this.world = new World();
+    this.scene.add(this.world.group);
+    this.buildMap();
+    progress('Painting facades & windows…', 0.4);
+    await tick();
+
+    progress('Casting actors…', 0.5);
+    await tick();
+    this.playerHuman = new Human(LOOKS.veer);
+    this.playerHuman.root.rotation.order = 'YXZ';
+    this.playerHuman.onStep = (s) => { if (!this.player.vehicle && this.state === 'play') this.audio.step(this.world.onRoad(this.player.x, this.player.z) ? 'asphalt' : 'pave', Math.hypot(this.player.vx, this.player.vz)); void s; };
+    this.scene.add(this.playerHuman.root);
+
+    this.crowd = new Crowd(this);
+    this.traffic = new Traffic(this);
+    this.police = new Police(this);
+    progress('Building story & characters…', 0.6);
+    await tick();
+    this.story = setupStory(this);
+
+    // beacons for mission markers
+    for (let i = 0; i < 4; i++) {
+      const m = new THREE.Mesh(
+        new THREE.CylinderGeometry(1, 1, 60, 24, 1, true),
+        new THREE.MeshBasicMaterial({ color: 0xffd23a, transparent: true, opacity: 0.22, blending: THREE.AdditiveBlending, depthWrite: false, side: THREE.DoubleSide })
+      );
+      m.geometry.translate(0, 30, 0);
+      m.visible = false;
+      this.scene.add(m);
+      this.beacons.push(m);
     }
 
-    this.camera.aspect = w / h;
-    this.camera.updateProjectionMatrix();
-
-    // ---- environment
-    say('Aasmaan aur roshni...');
+    progress('Compiling shaders…', 0.75);
     await tick();
-    const sky = makeSky();
-    this.scene.background = sky;
-    this.scene.environment = sky;
-    this.scene.environmentIntensity = 0.75;
-    this.scene.backgroundIntensity = 1.0;
-    this.scene.fog = new THREE.FogExp2(0xc99a88, 0.00115);
+    this.setupComposer();
+    this.resize();
 
-    const sun = new THREE.DirectionalLight(0xffb676, 3.1);
-    sun.castShadow = true;
-    sun.shadow.mapSize.set(2048, 2048);
-    const sc = sun.shadow.camera;
-    sc.left = -90; sc.right = 90; sc.top = 90; sc.bottom = -90; sc.near = 10; sc.far = 700;
-    sun.shadow.bias = -0.0003;
-    sun.shadow.normalBias = 0.05;
-    this.sun = sun;
-    this.scene.add(sun, sun.target);
-    this.scene.add(new THREE.HemisphereLight(0x9db2ff, 0x54423f, 0.45));
+    // inventory
+    for (const id of WEAPON_ORDER) this.inv[id] = { have: id === 'fists', mag: 0, reserve: 0 };
+    this.giveWeapon('pistol', 48);
+    this.loadGame();
+    this.selectWeapon(this.weapon);
 
-    // ---- city
-    say('Neon Nagri ban rahi hai...');
+    // spawn
+    const home = this.world.pois.find((p) => p.id === 'home')!;
+    this.player.x = home.x + 4; this.player.z = home.z - 3; this.player.heading = 0;
+    this.player.y = this.world.groundY(this.player.x, this.player.z);
+    this.camYaw = 0;
+    const starter = this.spawnCar('sports', 0x1368ff, home.x - 4, home.z - 3.5, Math.PI / 2, 'player');
+    starter.tag = 'starter';
+    this.lastCar = starter;
+
+    progress('Traffic & citizens…', 0.88);
     await tick();
-    this.city = buildCity();
-    this.scene.add(this.city.group);
-    const mc = makeCanvas(860, 760);
-    mc.g.translate(380, 380);
-    this.city.drawMap(mc.g);
-    this.mapCanvas = mc.c;
-
-    // ---- characters
-    say('Kirdaar aur gaadiyan...');
-    await tick();
-    this.veer = new Humanoid(VEER);
-    this.veer.onStep = (s) => {
-      if (!this.inCar && this.state === 'playing') this.audio.footstep(s);
-    };
-    this.scene.add(this.veer.root);
-    for (const k of Object.keys(NPC_DEFS)) {
-      const hm = new Humanoid(NPC_DEFS[k]);
-      hm.root.visible = false;
-      this.scene.add(hm.root);
-      this.npcs[k] = { h: hm, x: 0, z: 0, on: false };
-    }
-
-    this.car = new CarEntity('sport', 0x1368ff, { glow: 0xff2fd0 });
-    this.car.groundFn = this.city.groundY;
-    this.car.onCrash = (imp, x, z) => this.onCrash(imp, x, z);
-    this.car.group.visible = false;
-    this.scene.add(this.car.group);
-
-    const rng = mulberry32(99);
-    this.traffic = new Traffic(30, rng);
-    this.scene.add(this.traffic.group);
-    this.peds = new Peds(46, rng);
-    this.scene.add(this.peds.group);
-    this.scene.add(this.sparks.mesh);
-    for (const m of this.markerObjs) this.scene.add(m.group);
-    this.buildBoat();
-
-    // ---- post
-    try {
-      const scenePass = pass(this.scene, this.camera);
-      const col = scenePass.getTextureNode('output');
-      const bl = bloom(col, 0.42, 0.55, 1.7);
-      const vig = screenUV.sub(0.5).length().mul(1.3).pow(2.2);
-      const k = float(1).sub(vig.mul(this.boostU.mul(0.35).add(0.42)));
-      const pipe = new THREE.RenderPipeline(renderer);
-      pipe.outputNode = vec4(col.add(bl).rgb.mul(k), 1);
-      this.pipeline = pipe;
-    } catch (e) {
-      console.warn('Post-processing disabled', e);
-      this.pipeline = null;
-    }
-
-    // ---- start state
-    this.placeFoot(SPAWN.x, SPAWN.z, Math.PI / 2);
-    this.camYaw = Math.PI / 2;
-    this.veer.root.position.set(this.px, 0, this.pz);
-
-    say('Shaders compile ho rahe hain...');
-    await tick();
-    try {
-      await renderer.compileAsync(this.scene, this.camera);
-    } catch (e) {
-      console.warn('compileAsync failed', e);
-    }
-    if (this.disposed) return;
+    for (let i = 0; i < 10; i++) this.traffic.make(this.world.randomRoadSpawn());
+    for (let i = 0; i < 22; i++) this.crowd.spawnOne();
+    // prime a frame (compiles shaders for the first view)
+    this.positionPlayerHuman(0);
+    this.updateCamera(0.016, true);
+    try { await this.renderer.compileAsync(this.scene, this.camera); } catch { /* older GPUs */ }
+    this.composer.render(0.016);
+    progress('Ready', 1);
 
     window.addEventListener('resize', this.resize);
     window.addEventListener('keydown', this.onKeyDown);
     window.addEventListener('keyup', this.onKeyUp);
     window.addEventListener('blur', this.onBlur);
     window.addEventListener('mousemove', this.onMouseMove);
-    el.addEventListener('mousedown', this.onMouseDown);
+    this.canvas.addEventListener('mousedown', this.onMouseDown);
     window.addEventListener('mouseup', this.onMouseUp);
+    window.addEventListener('wheel', this.onWheel, { passive: true });
+    window.addEventListener('contextmenu', this.onCtx);
     document.addEventListener('pointerlockchange', this.onLockChange);
-
+    hud.phase = 'menu';
     this.state = 'menu';
-    this.hud.phase = 'menu';
+    this.refreshMissionList();
+    emitHud();
     this.last = performance.now();
-    renderer.setAnimationLoop(this.frame);
-    this.emit(true);
+    this.raf = requestAnimationFrame(this.frame);
   }
 
-  private buildBoat() {
-    const m = new Merger();
-    m.box(3.2, 1.1, 9, 0, 0.55, 0, 0xf4f4f4);
-    m.add(new THREE.ConeGeometry(1.6, 4, 4), 0xf4f4f4, M4(0, 0.55, 6.4, Math.PI / 2, Math.PI / 4, 0, 1, 1, 0.7));
-    m.box(3.25, 0.25, 9.05, 0, 0.9, 0, 0xc4262e);
-    m.box(2.2, 1.0, 2.6, 0, 1.6, -0.5, 0x15181d);
-    m.box(1.8, 0.1, 2.2, 0, 2.15, -0.5, 0xeeeeee);
-    const g = m.build()!;
-    const mat = new THREE.MeshStandardMaterial({ vertexColors: true, roughness: 0.4, metalness: 0.2 });
-    const mesh = new THREE.Mesh(g, mat);
-    mesh.castShadow = true;
-    this.boat.add(mesh);
-    this.boat.visible = false;
-    this.scene.add(this.boat);
+  private raf = 0;
+  private last = 0;
+
+  private setupComposer() {
+    const size = new THREE.Vector2();
+    this.renderer.getSize(size);
+    const rt = new THREE.WebGLRenderTarget(size.x, size.y, { type: THREE.HalfFloatType, samples: 4 });
+    this.composer = new EffectComposer(this.renderer, rt);
+    this.composer.addPass(new RenderPass(this.scene, this.camera));
+    this.bloom = new UnrealBloomPass(new THREE.Vector2(size.x, size.y), 0.42, 0.7, 0.92);
+    this.composer.addPass(this.bloom);
+    this.grade = new ShaderPass(GRADE);
+    this.composer.addPass(this.grade);
+    this.composer.addPass(new OutputPass());
   }
 
-  // =================================================================== public API for missions
-  say(lines: Line[]) {
-    this.queue.push(...lines);
-  }
-  sayDone() {
-    return !this.curLine && this.queue.length === 0;
-  }
-  setObjective(t: string | null) {
-    this.objective = t;
-  }
-  setMarkers(m: MarkerSpec[]) {
-    this.markers = m;
-  }
-  setIntensity(n: number) {
-    this.audio.intensity = n;
-  }
-  setLost(v: number | null) {
-    this.lost = v;
-  }
-  setCheckpoints(i: number | null, n: number) {
-    this.cp = i === null ? null : { i, n };
-  }
-  timerStart(sec: number, label: string) {
-    this.timer = { t: sec, label };
-  }
-  timerAdd(sec: number) {
-    if (this.timer) this.timer.t += sec;
-  }
-  timerStop() {
-    this.timer = null;
-  }
-  distTo(x: number, z: number) {
-    return Math.hypot(x - this.px, z - this.pz);
-  }
-  flash(text: string) {
-    this.toast(text, '', 'flash', 1.2);
-  }
-  fail(reason: string) {
-    if (this.failing || !this.missionActive) return;
-    this.failFlag = true;
-    this.failing = true;
-    this.missionActive = false;
-    this.audio.fail();
-    this.toast('MISSION FAILED', reason, 'fail', 3);
-    this.hud.fade = true;
-    this.after(2.8, () => {
-      this.hud.fade = false;
-      this.removeTarget();
-      this.clearDialogue();
-      this.respawn(MISSIONS[this.mi].respawn);
-      this.failing = false;
-      this.failFlag = false;
-      this.startMission(this.mi);
-    });
-  }
-  setNPC(key: string, pos: { x: number; z: number } | null) {
-    const n = this.npcs[key];
-    if (!n) return;
-    n.on = !!pos;
-    n.h.root.visible = !!pos;
-    if (pos) {
-      n.x = pos.x;
-      n.z = pos.z;
-      n.h.root.position.set(pos.x, 0.15, pos.z);
-    }
-  }
-  placeCar(x: number, z: number, h: number) {
-    this.car.place(x, z, h);
-    this.car.y = this.city.groundY(x, z);
-    this.car.group.visible = true;
-    this.carVisible = true;
-  }
-  spawnTarget(path: [number, number][]) {
-    this.removeTarget();
-    const t = new CarEntity('suv', 0x0b0c0e, {});
-    t.groundFn = this.city.groundY;
-    this.scene.add(t.group);
-    this.target = t;
-    const pts: { x: number; z: number }[] = [];
-    for (let k = 0; k < path.length - 1; k++) {
-      const a = { x: c(path[k][0]), z: c(path[k][1]) };
-      const b = { x: c(path[k + 1][0]), z: c(path[k + 1][1]) };
-      const dx = Math.sign(b.x - a.x), dz = Math.sign(b.z - a.z);
-      const ox = dz * 2, oz = -dx * 2; // left-hand lane
-      pts.push({ x: a.x + ox, z: a.z + oz }, { x: b.x + ox, z: b.z + oz });
-    }
-    this.tpts = pts;
-    this.tidx = 1;
-    const dx = pts[1].x - pts[0].x, dz = pts[1].z - pts[0].z;
-    t.place(pts[0].x, pts[0].z, Math.atan2(dx, dz));
-    this.targetGo = false;
-    this.targetArrived = false;
-  }
-  removeTarget() {
-    if (this.target) {
-      this.scene.remove(this.target.group);
-      this.target = null;
-    }
-    this.targetGo = false;
-    this.targetArrived = false;
-  }
-  finale() {
-    // fireworks over the harbour + Raghav's speedboat getting away
-    this.boat.visible = true;
-    this.boat.position.set(488, -1.0, -8);
-    this.boat.rotation.y = Math.PI / 2;
-    this.audio.complete();
-    const cols = [[3, 0.4, 0.8], [0.4, 2.2, 3.5], [3.5, 2.4, 0.3], [0.6, 3.5, 0.9], [2.6, 0.6, 3.4]];
-    for (let k = 0; k < 14; k++) {
-      this.after(0.6 + k * 0.7, () => {
-        const cc = cols[k % cols.length];
-        this.sparks.burst(430 + Math.random() * 60, 55 + Math.random() * 40, -50 + Math.random() * 100, new THREE.Color().setRGB(cc[0], cc[1], cc[2]), 80, 24);
-        this.audio.crash(5);
-      });
-    }
-    this.after(6, () => {
-      this.hud.ended = true;
-      this.hud.locked = false;
-      if (document.pointerLockElement) document.exitPointerLock();
-    });
-  }
-  continueFree() {
-    this.hud.ended = false;
-    this.boat.visible = false;
-    this.objective = 'Free roam — Neon Nagri ab tumhari hai';
-    this.audio.intensity = 0;
-    this.emit(true);
-  }
-
-  // =================================================================== lifecycle
-  start() {
-    if (this.state !== 'menu') return;
-    this.state = 'playing';
-    this.hud.phase = 'playing';
-    this.audio.start();
-    this.audio.ui();
-    this.camYaw = Math.PI / 2;
-    this.camInit = false;
-    this.startMission(0);
-    this.requestLock();
-    this.emit(true);
-  }
+  resize = () => {
+    const w = window.innerWidth, h = window.innerHeight;
+    this.renderer.setSize(w, h, false);
+    this.canvas.style.width = w + 'px';
+    this.canvas.style.height = h + 'px';
+    this.composer?.setSize(w, h);
+    this.camera.aspect = w / h;
+    this.camera.updateProjectionMatrix();
+  };
 
   dispose() {
     this.disposed = true;
+    cancelAnimationFrame(this.raf);
     window.removeEventListener('resize', this.resize);
     window.removeEventListener('keydown', this.onKeyDown);
     window.removeEventListener('keyup', this.onKeyUp);
-    window.removeEventListener('blur', this.onBlur);
     window.removeEventListener('mousemove', this.onMouseMove);
     window.removeEventListener('mouseup', this.onMouseUp);
+    window.removeEventListener('wheel', this.onWheel);
+    window.removeEventListener('contextmenu', this.onCtx);
+    window.removeEventListener('blur', this.onBlur);
     document.removeEventListener('pointerlockchange', this.onLockChange);
-    try {
-      this.renderer?.setAnimationLoop(null);
-      this.renderer?.domElement.removeEventListener('mousedown', this.onMouseDown);
-      this.renderer?.domElement.remove();
-      this.renderer?.dispose();
-    } catch {
-      /* ignore */
-    }
     this.audio.dispose();
-  }
-
-  toggleMute() {
-    this.audio.setMuted(!this.audio.muted);
-    this.hud.muted = this.audio.muted;
-    this.emit(true);
-  }
-  toggleMusic() {
-    this.hud.musicOn = this.audio.toggleMusic();
-    this.emit(true);
-  }
-
-  // =================================================================== missions
-  private startMission(i: number) {
-    this.mi = i;
-    this.si = 0;
-    const m = MISSIONS[i];
-    this.missionActive = true;
-    this.timer = null;
-    this.lost = null;
-    this.cp = null;
-    this.audio.intensity = m.intensity;
-    this.hud.mission = { n: i + 1, total: MISSIONS.length, title: m.title, tag: m.tag };
-    this.toast(m.title.toUpperCase(), `${m.tag} — ${m.blurb}`, 'info', 4.2);
-    this.audio.chime();
-    m.steps[0].enter?.(this);
-  }
-
-  private completeMission() {
-    const m = MISSIONS[this.mi];
-    this.missionActive = false;
-    this.cash += m.reward;
-    this.audio.complete();
-    this.timer = null;
-    this.markers = [];
-    this.objective = null;
-    this.lost = null;
-    this.cp = null;
-    this.toast('MISSION PASSED', `${m.title}  +$${m.reward.toLocaleString('en-US')}`, 'pass', 4.5);
-    this.audio.intensity = 0;
-    if (this.mi + 1 < MISSIONS.length) {
-      this.after(5, () => this.startMission(this.mi + 1));
-    }
-  }
-
-  private updateMission(dt: number) {
-    if (!this.missionActive) return;
-    const m = MISSIONS[this.mi];
-    const st = m.steps[this.si];
-    const r = st.update(this, dt);
-    if (this.failFlag) return;
-    if (r === 'done') {
-      st.exit?.(this);
-      this.si++;
-      if (this.si >= m.steps.length) this.completeMission();
-      else m.steps[this.si].enter?.(this);
-    }
-    if (this.timer && this.missionActive) {
-      this.timer.t -= dt;
-      if (this.timer.t <= 0) {
-        this.timer.t = 0;
-        this.fail('Waqt khatam ho gaya!');
-      }
-    }
-  }
-
-  private respawn(r: Respawn) {
-    this.setInCar(false);
-    if (r.car) this.placeCar(r.car.x, r.car.z, r.car.h);
-    if (r.inCar) {
-      this.placeCar(r.px, r.pz, r.ph);
-      this.setInCar(true);
-    } else {
-      this.placeFoot(r.px, r.pz, r.ph);
-    }
-    this.camYaw = r.ph;
-    this.camInit = false;
-  }
-
-  // =================================================================== helpers
-  private after(sec: number, fn: () => void) {
-    this.later.push({ t: sec, fn });
-  }
-
-  private toast(title: string, sub: string, kind: 'pass' | 'fail' | 'info' | 'flash', dur = 3) {
-    this.hud.toast = { title, sub, kind };
-    this.toastT = dur;
-    this.emit(true);
-  }
-
-  private clearDialogue() {
-    this.queue = [];
-    this.curLine = null;
-    this.hud.subtitle = null;
-  }
-
-  private placeFoot(x: number, z: number, h: number) {
-    this.px = x; this.pz = z; this.pheading = h;
-    this.py = this.city.groundY(x, z);
-    this.pvx = this.pvz = this.pvy = 0;
-  }
-
-  private setInCar(v: boolean) {
-    if (v === this.inCar && this.veer.root.parent) return;
-    this.inCar = v;
-    this.veer.root.removeFromParent();
-    if (v) {
-      this.car.model.body.add(this.veer.root);
-      this.veer.root.position.set(-0.4, 0.0, -0.18);
-      this.veer.root.rotation.set(0, 0, 0);
-      this.px = this.car.x;
-      this.pz = this.car.z;
-    } else {
-      this.scene.add(this.veer.root);
-    }
-  }
-
-  private interact() {
-    if (this.state !== 'playing') return;
-    if (this.inCar) {
-      if (Math.abs(this.car.speed) > 9) {
-        this.flash('Pehle gaadi roko!');
-        return;
-      }
-      const hd = this.car.heading;
-      const rx = -Math.cos(hd), rz = Math.sin(hd);
-      let ex = this.car.x + rx * 2.5, ez = this.car.z + rz * 2.5;
-      if (this.city.resolve(ex, ez, 0.45, this.hit)) {
-        // blocked on the driver side - try the other door
-        ex = this.car.x - rx * 2.5;
-        ez = this.car.z - rz * 2.5;
-        this.city.resolve(ex, ez, 0.45, this.hit);
-        ex = this.hit.x;
-        ez = this.hit.z;
-      } else {
-        ex = this.hit.x;
-        ez = this.hit.z;
-      }
-      this.setInCar(false);
-      this.placeFoot(ex, ez, hd);
-      this.audio.door();
-    } else if (this.carVisible && Math.hypot(this.car.x - this.px, this.car.z - this.pz) < 4.8) {
-      this.setInCar(true);
-      this.audio.door();
-    }
-  }
-
-  private onCrash(impact: number, x: number, z: number) {
-    this.audio.crash(impact);
-    this.shake = Math.min(1, impact / 16);
-    const col = new THREE.Color().setRGB(3, 1.8, 0.5);
-    const n = Math.min(24, 6 + Math.floor(impact));
-    for (let i = 0; i < n; i++) {
-      this.sparks.emit(x, 0.7, z, (Math.random() - 0.5) * 9, Math.random() * 5, (Math.random() - 0.5) * 9, 0.5 + Math.random() * 0.4, col, 0.25, 12);
-    }
+    this.renderer?.dispose();
   }
 
   // =================================================================== input
+  private onCtx = (e: Event) => e.preventDefault();
   private onKeyDown = (e: KeyboardEvent) => {
-    if (e.code === 'Space' || e.code.startsWith('Arrow') || e.code === 'Tab') e.preventDefault();
     if (e.repeat) return;
-    this.keys.add(e.code);
-    if (this.state !== 'playing') return;
-    switch (e.code) {
-      case 'Space': this.jumpPressed = true; break;
-      case 'KeyF': this.interact(); break;
-      case 'KeyR': this.resetCar(); break;
-      case 'KeyM': this.toggleMute(); break;
-      case 'KeyN': this.toggleMusic(); break;
-      case 'Enter': this.skipLine(); break;
+    const k = e.code;
+    this.keys.add(k);
+    this.keyPressed.add(k);
+    if (['Tab', 'Space', 'ArrowUp', 'ArrowDown'].includes(k)) e.preventDefault();
+    if (hud.phase === 'menu') return;
+    if (k === 'Escape' || k === 'KeyP') this.togglePause();
+    if (k === 'KeyM' && hud.phase === 'playing') { hud.fullMap = !hud.fullMap; if (hud.fullMap && document.pointerLockElement) document.exitPointerLock(); emitHud(); }
+    if (k === 'KeyT' && hud.phase === 'playing') { hud.phone = !hud.phone; if (hud.phone && document.pointerLockElement) document.exitPointerLock(); emitHud(); }
+    if (k === 'Space' || k === 'KeyE' || k === 'Enter') this.dialogueAdvance?.();
+    if (hud.dialogue?.choices) {
+      const n = parseInt(e.key);
+      if (n >= 1 && n <= hud.dialogue.choices.length) this.dialogueChoose?.(n - 1);
     }
   };
-  private onKeyUp = (e: KeyboardEvent) => {
-    this.keys.delete(e.code);
-  };
-  private onBlur = () => {
-    this.keys.clear();
-    this.dragging = false;
-  };
-  private onMouseDown = () => {
-    if (this.state === 'playing') {
-      this.dragging = true;
-      if (!document.pointerLockElement) this.requestLock();
-    }
-  };
-  private onMouseUp = () => {
-    this.dragging = false;
-  };
+  private onKeyUp = (e: KeyboardEvent) => this.keys.delete(e.code);
+  private onBlur = () => { this.keys.clear(); this.mouseDown = false; this.rmb = false; };
   private onMouseMove = (e: MouseEvent) => {
-    if (this.state !== 'playing') return;
-    if (!document.pointerLockElement && !this.dragging) return;
-    this.camYaw -= e.movementX * 0.0026;
-    this.camPitch = clamp(this.camPitch + e.movementY * 0.0022, -0.12, 1.15);
-    this.lastMouse = this.time;
+    if (document.pointerLockElement === this.canvas) { this.mouseDx += e.movementX; this.mouseDy += e.movementY; }
   };
+  private onMouseDown = (e: MouseEvent) => {
+    this.audio.init();
+    if (hud.phase !== 'playing') return;
+    if (document.pointerLockElement !== this.canvas && !hud.fullMap && !hud.phone && !hud.shop) { this.canvas.requestPointerLock(); return; }
+    if (e.button === 0) { this.mouseDown = true; this.dialogueAdvance?.(); }
+    if (e.button === 2) this.rmb = true;
+  };
+  private onMouseUp = (e: MouseEvent) => {
+    if (e.button === 0) this.mouseDown = false;
+    if (e.button === 2) this.rmb = false;
+  };
+  private onWheel = (e: WheelEvent) => { this.wheel += Math.sign(e.deltaY); };
   private onLockChange = () => {
-    this.hud.locked = !!document.pointerLockElement;
-    this.emit(true);
+    hud.locked = document.pointerLockElement === this.canvas;
+    if (!hud.locked) { this.mouseDown = false; this.rmb = false; }
+    emitHud();
   };
-  private requestLock() {
-    try {
-      const p = this.renderer.domElement.requestPointerLock() as unknown as Promise<void> | undefined;
-      if (p && typeof p.catch === 'function') p.catch(() => undefined);
-    } catch {
-      /* not available */
-    }
-  }
-  private skipLine() {
-    if (this.curLine) this.lineT = 0;
-  }
-  private resetCar() {
-    if (!this.carVisible) return;
-    // snap to the nearest road centre line, keeping the facing direction (left-hand traffic)
-    const px = this.car.x, pz = this.car.z;
-    let bi = 0, bj = 0, dx = 1e9, dz = 1e9;
-    for (let i = 0; i <= 8; i++) {
-      if (Math.abs(px - c(i)) < dx) { dx = Math.abs(px - c(i)); bi = i; }
-      if (Math.abs(pz - c(i)) < dz) { dz = Math.abs(pz - c(i)); bj = i; }
-    }
-    let x: number, z: number, h: number;
-    if (dx <= dz) {
-      const north = Math.cos(this.car.heading) >= 0;
-      h = north ? 0 : Math.PI;
-      x = c(bi) + (north ? 2 : -2);
-      z = clamp(pz, -300, 300);
-    } else {
-      const east = Math.sin(this.car.heading) >= 0;
-      h = east ? Math.PI / 2 : -Math.PI / 2;
-      z = c(bj) + (east ? -2 : 2);
-      x = clamp(px, -300, 300);
-    }
-    this.car.place(x, z, h);
-    this.car.y = 0;
-    this.flash('Gaadi sadak par wapas');
+  down(k: string) { return this.keys.has(k); }
+  pressed(k: string) { return this.keyPressed.has(k); }
+
+  startGame() {
+    this.audio.init();
+    this.audio.setVolume(hud.settings.volume, hud.settings.music);
+    hud.phase = 'playing';
+    this.state = 'play';
+    this.canvas.requestPointerLock();
+    this.positionPlayerHuman(0);
+    this.toast('NEON NAGRI', 'Welcome back, Veer. Dev is waiting at the Neon Lotus.', 'mission');
+    if (!this.missionRunning && !this.completed.has(this.missionIndex)) this.setHint('Open the phone [T] to start your next job');
+    this.refreshMissionList();
+    this.startMission(this.missionIndex);
+    emitHud();
   }
 
-  private onResize() {
-    const w = this.container.clientWidth || window.innerWidth;
-    const h = this.container.clientHeight || window.innerHeight;
-    this.renderer.setSize(w, h);
-    this.camera.aspect = w / h;
-    this.camera.updateProjectionMatrix();
+  togglePause() {
+    if (hud.phase === 'playing') {
+      hud.phase = 'paused';
+      this.paused = true;
+      if (document.pointerLockElement) document.exitPointerLock();
+    } else if (hud.phase === 'paused') {
+      hud.phase = 'playing';
+      this.paused = false;
+      this.canvas.requestPointerLock();
+    }
+    emitHud();
   }
 
-  // =================================================================== frame
-  private frame = () => {
+  setHint(t: string | null) { hud.hint = t; }
+
+  toast(title: string, text: string, kind: 'info' | 'good' | 'bad' | 'mission' | 'cash' = 'info') {
+    const id = this.toastId++;
+    hud.toasts = [...hud.toasts.slice(-3), { id, title, text, kind, t: this.time }];
+    emitHud();
+    setTimeout(() => { hud.toasts = hud.toasts.filter((t) => t.id !== id); emitHud(); }, 4200);
+  }
+
+  // =================================================================== weapons / inventory
+  giveWeapon(id: WeaponId, ammo = 0) {
+    const w = this.inv[id];
+    const def = WEAPONS[id];
+    if (!w.have) { w.have = true; w.mag = def.mag; }
+    w.reserve += ammo;
+  }
+  selectWeapon(id: WeaponId) {
+    if (!this.inv[id]?.have) return;
+    this.weapon = id;
+    this.reloadT = 0;
+    const def = WEAPONS[id];
+    this.wm = buildWeaponModel(id);
+    this.playerHuman.setWeapon(this.wm ? this.wm.group : null);
+    void def;
+    this.updateWeaponHud();
+  }
+  cycleWeapon(dir: number) {
+    const have = WEAPON_ORDER.filter((id) => this.inv[id].have);
+    const i = have.indexOf(this.weapon);
+    this.selectWeapon(have[(i + dir + have.length) % have.length]);
+  }
+  updateWeaponHud() {
+    const def = WEAPONS[this.weapon], inv = this.inv[this.weapon];
+    hud.weapon = { id: def.id, name: def.name, icon: def.icon, mag: inv.mag, reserve: inv.reserve, cls: def.cls, reloading: this.reloadT > 0, infinite: def.mag === 0 };
+  }
+
+  // =================================================================== factory helpers
+  spawnCar(kind: CarKind, color: number, x: number, z: number, h: number, role: Vehicle['role'] = 'parked') {
+    const v = new Vehicle(kind, color);
+    v.role = role;
+    v.place(x, z, h, this.world);
+    v.onCrash = (veh, imp, cx, cz) => this.onVehicleCrash(veh, imp, cx, cz);
+    v.onExplode = (veh) => this.onVehicleExplode(veh);
+    this.scene.add(v.group);
+    this.vehicles.push(v);
+    return v;
+  }
+  removeVehicle(v: Vehicle) {
+    this.scene.remove(v.group);
+    const i = this.vehicles.indexOf(v); if (i >= 0) this.vehicles.splice(i, 1);
+    this.traffic.list = this.traffic.list.filter((q) => q !== v);
+  }
+  spawnNpc(look: Look, role: Npc['role'], x: number, z: number, h = 0) {
+    const n = new Npc(look, role);
+    n.place(x, z, h);
+    n.y = this.world.groundY(x, z);
+    this.scene.add(n.human.root);
+    this.crowd.list.push(n);
+    this.npcs.push(n);
+    return n;
+  }
+  removeNpc(n: Npc) {
+    n.removed = true;
+  }
+
+  // =================================================================== frame loop
+  private frame = (now: number) => {
     if (this.disposed) return;
-    const now = performance.now();
-    const dt = Math.min(0.05, (now - this.last) / 1000);
+    this.raf = requestAnimationFrame(this.frame);
+    let dt = Math.min(0.05, (now - this.last) / 1000);
     this.last = now;
-    this.time += dt;
-
-    if (this.state === 'playing') this.updatePlaying(dt);
-    else this.updateMenu(dt);
-
-    this.city.update(this.time, dt);
-    this.sparks.update(dt);
-    this.markerObjs.forEach((m) => m.update(this.time));
-    if (this.boat.visible) {
-      this.boat.position.x += 17 * dt;
-      this.boat.position.y = -1.0 + Math.sin(this.time * 3) * 0.08;
-      if (this.boat.position.x > 1100) this.boat.visible = false;
+    this.fpsAcc += dt; this.fpsN++;
+    if (this.fpsAcc > 0.5) { hud.fps = Math.round(this.fpsN / this.fpsAcc); this.fpsAcc = 0; this.fpsN = 0; }
+    if (!this.paused) {
+      dt *= this.slowmo;
+      this.update(dt);
     }
-    for (let i = this.later.length - 1; i >= 0; i--) {
-      this.later[i].t -= dt;
-      if (this.later[i].t <= 0) {
-        const f = this.later[i].fn;
-        this.later.splice(i, 1);
-        f();
-      }
-    }
-    if (this.toastT > 0) {
-      this.toastT -= dt;
-      if (this.toastT <= 0) {
-        this.hud.toast = null;
-        this.emit(true);
-      }
-    }
-    this.updateSun();
-    this.draw();
-    this.adapt(dt);
-    this.drawMinimap();
-    this.emit(false);
+    this.render(dt);
+    this.keyPressed.clear();
+    this.mouseDx = 0; this.mouseDy = 0; this.wheel = 0;
   };
 
-  private draw() {
-    if (this.pipeline) {
-      try {
-        this.pipeline.render();
-        return;
-      } catch (e) {
-        console.warn('pipeline failed, falling back', e);
-        this.pipeline = null;
-      }
-    }
-    this.renderer.render(this.scene, this.camera);
+  private render(dt: number) {
+    this.grade.uniforms.uTime.value = this.time;
+    const sp = this.player.vehicle ? clamp((Math.abs(this.player.vehicle.speed) - 30) / 40, 0, 1) + (this.player.vehicle.boosting ? 0.5 : 0) : 0;
+    this.grade.uniforms.uSpeed.value = damp(this.grade.uniforms.uSpeed.value, sp, 4, dt);
+    this.grade.uniforms.uDamage.value = clamp(hud.damage, 0, 1) + (this.player.hp < 30 ? (30 - this.player.hp) / 60 : 0);
+    this.grade.uniforms.uAim.value = hud.aiming ? 1 : 0;
+    this.bloom.enabled = hud.settings.bloom;
+    this.bloom.strength = 0.28 + this.sky.night * 0.5;
+    this.composer.render(dt);
   }
 
-  private adapt(dt: number) {
-    this.fpsAcc += dt;
-    this.fpsN++;
-    this.adaptT += dt;
-    if (this.fpsAcc >= 1) {
-      this.fps = Math.round(this.fpsN / this.fpsAcc);
-      this.fpsAcc = 0;
-      this.fpsN = 0;
-    }
-    if (this.adaptT > 2.5) {
-      this.adaptT = 0;
-      let nr = this.res;
-      if (this.fps < 40 && this.res > 0.65) nr = Math.max(0.65, this.res - 0.15);
-      else if (this.fps > 57 && this.res < this.maxRes) nr = Math.min(this.maxRes, this.res + 0.1);
-      if (Math.abs(nr - this.res) > 0.01) {
-        this.res = nr;
-        this.renderer.setPixelRatio(nr);
-      }
-    }
+  update(dt: number) {
+    this.time += dt;
+    this.menuT += dt;
+    const night = this.sky.night;
+    if (this.state === 'menu') this.updateMenu(dt);
+    else this.updatePlayer(dt);
+    this.updateWorld(dt, night);
+    this.updateCamera(dt);
+    this.sky.update(dt, hud.phase === 'playing' ? hud.settings.timeScale * 6 : 2, this.focus(), this.camera);
+    this.world.update(dt, this.time, this.focus(), this.sky.night);
+    this.fx.update(dt, this.renderer.domElement.height * 0.5);
+    this.updateAudio(dt);
+    this.updateWaiters();
+    this.updateHud(dt);
+    this.keyPressedAfter();
+  }
+  private keyPressedAfter() { /* reserved */ }
+
+  focus() {
+    return this.player.vehicle ? new THREE.Vector3(this.player.vehicle.x, 0, this.player.vehicle.z) : new THREE.Vector3(this.player.x, 0, this.player.z);
   }
 
-  private updateSun() {
-    const f = this.state === 'playing' ? { x: this.px, y: this.py, z: this.pz } : { x: this.camera.position.x, y: 0, z: this.camera.position.z };
-    const L = SUN_DIR;
-    const right = new THREE.Vector3(0, 1, 0).cross(L).normalize();
-    const up2 = new THREE.Vector3().crossVectors(L, right);
-    const t = new THREE.Vector3(f.x, f.y, f.z);
-    const texel = 180 / 2048;
-    const a = Math.round(t.dot(right) / texel) * texel;
-    const b = Math.round(t.dot(up2) / texel) * texel;
-    const d = t.dot(L);
-    const s = right.multiplyScalar(a).add(up2.multiplyScalar(b)).add(L.clone().multiplyScalar(d));
-    this.sun.target.position.copy(s);
-    this.sun.position.copy(s).addScaledVector(L, 300);
-    this.sun.target.updateMatrixWorld();
-  }
-
-  // ------------------------------------------------------------------ menu
   private updateMenu(dt: number) {
-    this.menuAngle += dt * 0.045;
-    const tt = this.city.towerTop;
-    const r = 210;
-    const a = this.menuAngle + 2.2;
-    this.camera.position.set(tt.x + Math.cos(a) * r, 62 + Math.sin(this.time * 0.2) * 6, tt.z + Math.sin(a) * r);
-    this.camera.lookAt(tt.x, tt.y * 0.55, tt.z);
-    this.camera.fov = 58;
-    this.camera.updateProjectionMatrix();
-    this.camYaw = Math.atan2(tt.x - this.camera.position.x, tt.z - this.camera.position.z);
-    this.px = tt.x;
-    this.pz = tt.z;
-    this.traffic.update(dt, this.time, [], this.camera.position);
-    this.peds.update(dt, tt.x, tt.z);
-    this.veer.root.visible = false;
+    // showcase camera orbit around Veer + his car
+    this.positionPlayerHuman(dt);
+    this.playerHuman.update(dt, this.playerHs);
   }
 
-  // ------------------------------------------------------------------ playing
-  private updatePlaying(dt: number) {
-    this.veer.root.visible = true;
-    const k = this.keys;
-    const throttle = (k.has('KeyW') || k.has('ArrowUp') ? 1 : 0) - (k.has('KeyS') || k.has('ArrowDown') ? 1 : 0);
-    const steer = (k.has('KeyD') || k.has('ArrowRight') ? 1 : 0) - (k.has('KeyA') || k.has('ArrowLeft') ? 1 : 0);
-    const shift = k.has('ShiftLeft') || k.has('ShiftRight');
-    if (k.has('KeyQ')) { this.camYaw += dt * 1.8; this.lastMouse = this.time; }
-    if (k.has('KeyE')) { this.camYaw -= dt * 1.8; this.lastMouse = this.time; }
-    const horn = k.has('KeyH');
-    if (horn !== this.hornOn) {
-      this.hornOn = horn;
-      this.audio.setHorn(horn);
-    }
-
-    if (this.inCar) {
-      this.car.update(dt, { throttle, steer, hand: k.has('Space'), boost: shift }, this.city);
-      this.px = this.car.x;
-      this.pz = this.car.z;
-      this.py = this.car.y;
-      this.steerSm += (steer - this.steerSm) * (1 - Math.exp(-dt * 8));
-      this.veer.update(dt, { speed: 0, air: false, sit: true, steer: this.steerSm, throttle });
-    } else {
-      if (this.carVisible) this.car.update(dt, { throttle: 0, steer: 0, hand: true, boost: false }, this.city);
-      this.updateFoot(dt, throttle, steer, shift);
-    }
-    this.jumpPressed = false;
-
-    this.updateTarget(dt);
-
-    // traffic
-    const obs: { x: number; z: number }[] = [];
-    if (this.carVisible) obs.push({ x: this.car.x, z: this.car.z });
-    if (!this.inCar) obs.push({ x: this.px, z: this.pz });
-    if (this.target) obs.push({ x: this.target.x, z: this.target.z });
-    this.traffic.update(dt, this.time, obs, this.camera.position);
-    this.peds.update(dt, this.px, this.pz);
-    this.trafficCollisions();
-
-    this.updateDialogue(dt);
-    this.updateMission(dt);
-    this.updateNpcs(dt);
-
-    this.updateCamera(dt, shift);
-    this.updateMarkers();
-
-    const sp = this.inCar ? Math.abs(this.car.speed) : 0;
-    this.audio.updateDrive(sp, this.inCar ? Math.max(0, throttle) : 0, this.inCar, this.car.boosting && this.inCar, this.car.slip);
+  // =================================================================== player
+  private positionPlayerHuman(dt: number) {
+    const p = this.player;
+    if (p.vehicle) return;
+    const r = this.playerHuman.root;
+    r.position.set(p.x, p.y, p.z);
+    r.rotation.y = p.heading;
+    void dt;
   }
 
-  private updateFoot(dt: number, f: number, s: number, sprint: boolean) {
-    const fx = Math.sin(this.camYaw), fz = Math.cos(this.camYaw);
-    const rx = -fz, rz = fx;
-    const dx = fx * f + rx * s, dz = fz * f + rz * s;
-    const len = Math.hypot(dx, dz);
-    let tvx = 0, tvz = 0;
-    if (len > 0.01) {
-      const v = sprint ? 9.4 : 5.4;
-      tvx = (dx / len) * v;
-      tvz = (dz / len) * v;
-    }
-    const a = 1 - Math.exp(-dt * (this.pgrounded ? 10 : 2.5));
-    this.pvx += (tvx - this.pvx) * a;
-    this.pvz += (tvz - this.pvz) * a;
-    this.px += this.pvx * dt;
-    this.pz += this.pvz * dt;
-    if (this.city.resolve(this.px, this.pz, 0.4, this.hit) && this.hit.hit) {
-      this.px = this.hit.x;
-      this.pz = this.hit.z;
-      const vn = this.pvx * this.hit.nx + this.pvz * this.hit.nz;
-      if (vn < 0) {
-        this.pvx -= vn * this.hit.nx;
-        this.pvz -= vn * this.hit.nz;
-      }
-    }
-    const gy = this.city.groundY(this.px, this.pz);
-    if (this.jumpPressed && this.pgrounded) {
-      this.pvy = 6.2;
-      this.pgrounded = false;
-    }
-    this.pvy -= 20 * dt;
-    this.py += this.pvy * dt;
-    if (this.py <= gy) {
-      this.py = gy;
-      this.pvy = 0;
-      this.pgrounded = true;
-    } else this.pgrounded = this.py - gy < 0.03;
-
-    const spd = Math.hypot(this.pvx, this.pvz);
-    if (spd > 0.5) this.pheading += angDiff(this.pheading, Math.atan2(this.pvx, this.pvz)) * (1 - Math.exp(-dt * 12));
-    this.veer.update(dt, { speed: spd, air: !this.pgrounded, sit: false, steer: 0 });
-    this.veer.root.position.set(this.px, this.py, this.pz);
-    this.veer.root.rotation.set(0, this.pheading, 0);
+  private moveInput() {
+    let ix = 0, iz = 0;
+    if (this.down('KeyW') || this.down('ArrowUp')) iz += 1;
+    if (this.down('KeyS') || this.down('ArrowDown')) iz -= 1;
+    if (this.down('KeyD') || this.down('ArrowRight')) ix += 1;
+    if (this.down('KeyA') || this.down('ArrowLeft')) ix -= 1;
+    return { ix, iz };
   }
 
-  private trafficCollisions() {
-    const offs = [1.3, -1.3];
-    // player car
-    if (this.carVisible) {
-      const car = this.car;
-      const fx = Math.sin(car.heading), fz = Math.cos(car.heading);
-      for (const t of this.traffic.cars) {
-        const ddx = t.x - car.x, ddz = t.z - car.z;
-        if (ddx * ddx + ddz * ddz > 36) continue;
-        const tx = Math.sin(t.heading), tz = Math.cos(t.heading);
-        for (const po of offs) {
-          for (const to of offs) {
-            const ax = car.x + fx * po, az = car.z + fz * po;
-            const bx = t.x + tx * to, bz = t.z + tz * to;
-            const dx = ax - bx, dz = az - bz;
-            const d = Math.hypot(dx, dz);
-            const rr = 2.1;
-            if (d < rr && d > 1e-4) {
-              const imp = car.bump(dx / d, dz / d, rr - d);
-              if (imp > 2.5) this.onCrash(imp, (ax + bx) / 2, (az + bz) / 2);
-              t.v = Math.max(0, t.v - 2);
-            }
-          }
-        }
-      }
+  private updatePlayer(dt: number) {
+    const p = this.player;
+    const sens = 0.0022 * hud.settings.sens;
+    const locked = document.pointerLockElement === this.canvas;
+    const inDialogue = !!hud.dialogue;
+    if (locked && !inDialogue) {
+      this.camYaw -= this.mouseDx * sens;
+      this.camPitch = clamp(this.camPitch + this.mouseDy * sens, -0.55, 1.1);
+      if (Math.abs(this.mouseDx) + Math.abs(this.mouseDy) > 0) this.camLookT = 2.2;
     }
-    if (!this.inCar) {
-      for (const t of this.traffic.cars) {
-        const ddx = t.x - this.px, ddz = t.z - this.pz;
-        if (ddx * ddx + ddz * ddz > 25) continue;
-        const tx = Math.sin(t.heading), tz = Math.cos(t.heading);
-        for (const to of offs) {
-          const bx = t.x + tx * to, bz = t.z + tz * to;
-          const dx = this.px - bx, dz = this.pz - bz;
-          const d = Math.hypot(dx, dz);
-          if (d < 1.3 && d > 1e-4) {
-            this.px += (dx / d) * (1.3 - d);
-            this.pz += (dz / d) * (1.3 - d);
-          }
-        }
-      }
-    }
-  }
+    this.camLookT -= dt;
+    p.aim = this.rmb && !p.vehicle && this.state === 'play' && !inDialogue;
+    hud.aiming = p.aim;
 
-  private updateTarget(dt: number) {
-    const t = this.target;
-    if (!t) return;
-    if (!this.targetGo || this.targetArrived) {
-      t.update(dt, { throttle: 0, steer: 0, hand: true, boost: false }, this.city);
+    if (this.state === 'dead' || this.state === 'busted') {
+      this.respawnT -= dt;
+      this.playerHuman.update(dt, this.playerHs);
+      if (this.respawnT <= 0) this.respawn();
       return;
     }
-    const p = this.tpts[this.tidx];
-    const dx = p.x - t.x, dz = p.z - t.z;
-    const dist = Math.hypot(dx, dz);
-    const last = this.tidx >= this.tpts.length - 1;
-    if (dist < (last ? 5 : 9)) {
-      if (last) {
-        this.targetArrived = true;
+    if (p.hp > 0 && p.hp < 100 && this.time - this.lastDamage > 7) p.hp = Math.min(100, p.hp + dt * 1.8);
+    // interaction target
+    this.updateInteract();
+    if ((this.pressed('KeyE') || this.pressed('KeyF')) && !inDialogue && this.state === 'play') this.doInteract();
+    // weapons select
+    if (!p.vehicle) {
+      for (let i = 0; i < WEAPON_ORDER.length; i++) if (this.pressed('Digit' + (i + 1))) this.selectWeapon(WEAPON_ORDER[i]);
+      if (this.wheel !== 0) this.cycleWeapon(this.wheel);
+      if (this.pressed('Tab')) this.cycleWeapon(1);
+    }
+    if (p.vehicle) this.updateDriving(dt);
+    else this.updateOnFoot(dt);
+    this.updateWeapons(dt);
+    // pickups
+    for (let i = this.pickups.length - 1; i >= 0; i--) {
+      const c = this.pickups[i];
+      c.mesh.rotation.y += dt * 3;
+      c.mesh.position.y = 0.6 + Math.sin(this.time * 3 + i) * 0.1;
+      c.t -= dt;
+      const d = Math.hypot(c.x - p.x, c.z - p.z);
+      if (d < (p.vehicle ? 3.2 : 1.6)) { this.addCash(c.amt); this.audio.cash(); this.scene.remove(c.mesh); this.pickups.splice(i, 1); }
+      else if (c.t < 0) { this.scene.remove(c.mesh); this.pickups.splice(i, 1); }
+    }
+  }
+
+  private updateOnFoot(dt: number) {
+    const p = this.player;
+    const h = this.playerHuman;
+    const hs = this.playerHs;
+    const inDialogue = !!hud.dialogue || this.state === 'cinematic';
+    const { ix, iz } = inDialogue ? { ix: 0, iz: 0 } : this.moveInput();
+    const sprint = this.down('ShiftLeft') && !p.aim && !p.crouch;
+    if (this.pressed('KeyC') && !inDialogue) p.crouch = !p.crouch;
+    const cf = { x: Math.sin(this.camYaw), z: Math.cos(this.camYaw) };
+    const cr = { x: -Math.cos(this.camYaw), z: Math.sin(this.camYaw) };
+    let dx = cf.x * iz + cr.x * ix, dz = cf.z * iz + cr.z * ix;
+    const l = Math.hypot(dx, dz);
+    if (l > 0) { dx /= l; dz /= l; }
+    const base = p.crouch ? 1.6 : p.aim ? 2.4 : sprint ? 6.4 : 3.4;
+    const spd = l > 0 ? base : 0;
+    const k = p.onGround ? 11 : 2.5;
+    p.vx = damp(p.vx, dx * spd, k, dt);
+    p.vz = damp(p.vz, dz * spd, k, dt);
+    // facing
+    const shooting = this.mouseDown && WEAPONS[this.weapon].cls !== 'none' && WEAPONS[this.weapon].cls !== 'melee';
+    if (p.aim || shooting || this.meleeT > 0) p.heading = dampAngle(p.heading, this.camYaw, 16, dt);
+    else if (l > 0.1) p.heading = dampAngle(p.heading, Math.atan2(dx, dz), 12, dt);
+    // jump
+    if (this.pressed('Space') && p.onGround && !inDialogue && !p.crouch) { p.vy = 5.6; p.onGround = false; }
+    p.x += p.vx * dt; p.z += p.vz * dt;
+    const gy = this.world.groundY(p.x, p.z);
+    if (!p.onGround || p.y > gy + 0.05) {
+      p.vy -= 17 * dt;
+      p.y += p.vy * dt;
+      if (p.y <= gy) { p.y = gy; p.vy = 0; p.onGround = true; }
+      else p.onGround = false;
+    } else {
+      p.y = damp(p.y, gy, 18, dt);
+    }
+    const hit = this.tmpHit;
+    if (this.world.resolve(p.x, p.z, 0.34, hit, p.y) && hit.hit) { p.x = hit.x; p.z = hit.z; }
+    // push by vehicles (stand clear!)
+    for (const v of this.vehicles) {
+      if (Math.abs(v.speed) < 2 || Math.abs(v.x - p.x) > 6 || Math.abs(v.z - p.z) > 6) continue;
+      const rel = this.toLocal(v, p.x, p.z);
+      const hw = v.spec.W / 2 + 0.3, hl = v.spec.L / 2 + 0.2;
+      if (Math.abs(rel.x) < hw && Math.abs(rel.z) < hl && p.y < v.y + 1.4) {
+        this.damagePlayer(Math.abs(v.speed) * 3.5, v.x, v.z);
+        const d = Math.hypot(p.x - v.x, p.z - v.z) || 1;
+        p.vx += ((p.x - v.x) / d) * Math.abs(v.speed) * 0.8; p.vz += ((p.z - v.z) / d) * Math.abs(v.speed) * 0.8;
+        this.audio.hit();
+      }
+    }
+    // animate
+    const fx = Math.sin(p.heading), fz = Math.cos(p.heading);
+    hs.vf = p.vx * fx + p.vz * fz;
+    hs.vs = p.vx * Math.cos(p.heading) - p.vz * Math.sin(p.heading);
+    hs.aim = p.aim || (shooting && this.time - this.lastShot < 0.4);
+    hs.aimPitch = this.camPitch * 0.9 - 0.15;
+    hs.stance = p.crouch ? 'crouch' : 'stand';
+    hs.air = !p.onGround;
+    hs.weapon = WEAPONS[this.weapon].cls;
+    hs.talk = !!hud.dialogue && !!this.dialogNpc && false;
+    hs.panic = false;
+    hs.lookX = 0;
+    h.root.position.set(p.x, p.y, p.z);
+    h.root.rotation.y = p.heading;
+    h.update(dt, hs);
+    this.distAcc += Math.hypot(p.vx, p.vz) * dt;
+  }
+
+  private toLocal(v: Vehicle, x: number, z: number) {
+    const dx = x - v.x, dz = z - v.z;
+    const c = Math.cos(v.heading), s = Math.sin(v.heading);
+    // right axis = (-cos, sin) ... local x = left (+x), local z = forward
+    return { x: dx * c - dz * s, z: dx * s + dz * c };
+  }
+
+  private updateDriving(dt: number) {
+    const p = this.player;
+    const v = p.vehicle!;
+    const c = v.ctl;
+    const inDialogue = !!hud.dialogue || this.state === 'cinematic';
+    let th = 0, st = 0;
+    if (!inDialogue) {
+      if (this.down('KeyW') || this.down('ArrowUp')) th += 1;
+      if (this.down('KeyS') || this.down('ArrowDown')) th -= 1;
+      if (this.down('KeyD') || this.down('ArrowRight')) st += 1;
+      if (this.down('KeyA') || this.down('ArrowLeft')) st -= 1;
+    }
+    c.throttle = th; c.steer = st; c.hand = this.down('Space') && !inDialogue; c.boost = this.down('ShiftLeft') && !inDialogue;
+    v.horn = this.down('KeyH');
+    if (this.pressed('KeyR')) this.nextStation();
+    if (this.pressed('KeyG')) v.sirenOn = v.kind === 'police' ? !v.sirenOn : false;
+    // sync player
+    p.x = v.x; p.y = v.y; p.z = v.z; p.vx = v.vx; p.vz = v.vz; p.heading = v.heading;
+    // human in seat
+    const hs = this.playerHs;
+    hs.stance = 'drive'; hs.steer = v.steerAngle / 0.6; hs.weapon = 'none'; hs.aim = false; hs.vf = 0; hs.vs = 0; hs.air = false;
+    hs.lookX = 0;
+    this.playerHuman.update(dt, hs);
+    this.distAcc += Math.abs(v.speed) * dt;
+    // tyre smoke / skid marks
+    if (v.skid) {
+      const fx = Math.sin(v.heading), fz = Math.cos(v.heading);
+      for (const w of v.model.wheels) {
+        if (w.front) continue;
+        const wx = v.x + fx * v.spec.zr + (-fz) * (w.sign > 0 ? 1 : -1) * (v.spec.W / 2 - 0.15), wz = v.z + fz * v.spec.zr + fx * (w.sign > 0 ? 1 : -1) * (v.spec.W / 2 - 0.15);
+        void wx; void wz;
+      }
+    }
+  }
+
+  nextStation() {
+    this.audio.setStation(this.audio.station + 1);
+    hud.radio = STATIONS[this.audio.station];
+    emitHud();
+  }
+
+  // =================================================================== interaction
+  private updateInteract() {
+    const p = this.player;
+    this.interact = { kind: 'none' };
+    let prompt: string | null = null;
+    if (hud.dialogue || this.state !== 'play' || hud.shop) { hud.prompt = null; return; }
+    if (!p.vehicle) {
+      let best = 3.2;
+      for (const n of this.npcs) {
+        if (!n.alive || !n.key || n.removed) continue;
+        const d = Math.hypot(n.x - p.x, n.z - p.z);
+        if (d < best && this.story?.canTalk(n.key)) { best = d; this.interact = { kind: 'npc', npc: n }; prompt = `Talk to ${n.name}`; }
+      }
+      if (this.interact.kind === 'none') {
+        for (const poi of this.world.pois) {
+          if (!['shop', 'service', 'home'].includes(poi.kind) || poi.r < 2) continue;
+          if (Math.hypot(poi.x - p.x, poi.z - p.z) < poi.r) {
+            this.interact = { kind: 'poi', poi: poi.id };
+            prompt = poi.kind === 'home' ? 'Enter Safehouse' : `Enter ${poi.name}`;
+            break;
+          }
+        }
+      }
+      if (this.interact.kind === 'none') {
+        let bd = 3.6, bv: Vehicle | null = null;
+        for (const v of this.vehicles) {
+          if (v.wrecked || v.role === 'swat') continue;
+          const d = Math.hypot(v.x - p.x, v.z - p.z);
+          if (d < bd + v.spec.L * 0.1) { bd = d; bv = v; }
+        }
+        if (bv) { this.interact = { kind: 'veh', veh: bv }; prompt = bv.role === 'traffic' || bv.role === 'police' ? `Carjack ${bv.spec.name}` : `Enter ${bv.spec.name}`; }
+      }
+    } else {
+      const v = p.vehicle;
+      prompt = 'Exit vehicle';
+      // service POIs while driving
+      for (const poi of this.world.pois) {
+        if (poi.r < 2 || !['service'].includes(poi.kind)) continue;
+        if ((poi.id === 'garage' || poi.id === 'spray') && Math.hypot(poi.x - p.x, poi.z - p.z) < poi.r + 3 && Math.abs(v.speed) < 6) {
+          this.interact = { kind: 'poi', poi: poi.id };
+          prompt = `${poi.name} — [E] Service`;
+        }
+      }
+      if (this.interact.kind === 'none') this.interact = { kind: 'veh', veh: v };
+    }
+    hud.prompt = prompt;
+  }
+
+  private doInteract() {
+    const it = this.interact;
+    if (it.kind === 'npc' && it.npc) this.story?.talk(it.npc.key);
+    else if (it.kind === 'poi' && it.poi) this.openPoi(it.poi);
+    else if (it.kind === 'veh' && it.veh) {
+      if (this.player.vehicle) this.exitVehicle();
+      else this.enterVehicle(it.veh);
+    }
+  }
+
+  enterVehicle(v: Vehicle) {
+    const p = this.player;
+    if (v.role === 'traffic' || v.role === 'police') {
+      // pull the driver out
+      const look = this.crowd.looks[Math.floor(Math.random() * this.crowd.looks.length)];
+      const side = Math.sign(this.toLocal(v, p.x, p.z).x) || 1;
+      const fx = Math.sin(v.heading), fz = Math.cos(v.heading);
+      const n = this.spawnNpc(look, 'ped', v.x + Math.cos(v.heading) * side * 2.2, v.z - Math.sin(v.heading) * side * 2.2 + fz * 0, 0);
+      n.state = 'flee'; n.stateT = 8; n.fleeFrom = { x: p.x, z: p.z };
+      void fx;
+      this.crime(v.role === 'police' ? 3 : 2, v.x, v.z);
+      this.crowd.scareAround(v.x, v.z, 30);
+      const ai = v.ai as { pursuit?: boolean } | null;
+      if (ai) ai.pursuit = false;
+      v.sirenOn = false;
+      v.role = 'player';
+      this.traffic.list = this.traffic.list.filter((q) => q !== v);
+    }
+    v.role = 'player';
+    v.isPlayer = true;
+    v.driver = this.playerHuman;
+    p.vehicle = v;
+    this.lastCar = v;
+    v.group.add(this.playerHuman.root);
+    this.playerHuman.root.position.set(v.model.driver.x, v.model.driver.y, v.model.driver.z);
+    this.playerHuman.root.rotation.set(0, 0, 0);
+    this.playerHuman.setWeapon(null);
+    this.playerHuman.sitDrop = 0.43;
+    this.audio.door();
+    hud.inCar = true; hud.carName = v.spec.name;
+    hud.radio = STATIONS[this.audio.station];
+    this.camLookT = 0;
+    this.camYaw = v.heading;
+    emitHud();
+  }
+
+  exitVehicle() {
+    const p = this.player;
+    const v = p.vehicle;
+    if (!v) return;
+    // find a free spot next to the car
+    const left = { x: Math.cos(v.heading), z: -Math.sin(v.heading) };
+    let placed = false;
+    for (const s of [1, -1]) {
+      const x = v.x + left.x * s * (v.spec.W / 2 + 0.9), z = v.z + left.z * s * (v.spec.W / 2 + 0.9);
+      if (!this.world.resolve(x, z, 0.4, this.tmpHit, 0.3) || !this.tmpHit.hit) { p.x = x; p.z = z; placed = true; break; }
+    }
+    if (!placed) { p.x = v.x + left.x * 2.5; p.z = v.z + left.z * 2.5; }
+    p.y = this.world.groundY(p.x, p.z);
+    p.vx = v.vx * 0.5; p.vz = v.vz * 0.5;
+    p.heading = v.heading;
+    v.group.remove(this.playerHuman.root);
+    this.scene.add(this.playerHuman.root);
+    this.playerHuman.root.position.set(p.x, p.y, p.z);
+    this.playerHuman.root.rotation.set(0, p.heading, 0);
+    v.driver = null; v.isPlayer = false;
+    v.ctl = noControl();
+    v.sirenOn = false; v.horn = false;
+    p.vehicle = null;
+    this.playerHs.stance = 'stand';
+    this.selectWeapon(this.weapon);
+    this.audio.door();
+    this.audio.noEngine();
+    this.audio.skid(0);
+    hud.inCar = false;
+    this.camYaw = p.heading;
+    emitHud();
+  }
+
+  // ---------------------------------------------------------------- POIs & shops
+  openPoi(id: string) {
+    const p = this.player;
+    const items = [];
+    if (document.pointerLockElement) document.exitPointerLock();
+    if (id === 'ammu') {
+      for (const w of WEAPON_ORDER) {
+        if (w === 'fists') continue;
+        const d = WEAPONS[w];
+        const owned = this.inv[w].have;
+        items.push({ id: 'w:' + w, label: owned ? `${d.name} — ammo` : d.name, desc: owned ? `Buy a magazine (${d.mag} rounds)` : `Dmg ${d.dmg}${d.pellets > 1 ? '×' + d.pellets : ''} · ${d.rate}/s · mag ${d.mag}`, price: owned ? d.ammoPrice : d.price, tag: owned ? 'AMMO' : 'NEW' });
+      }
+      items.push({ id: 'armor', label: 'Body Armor', desc: 'Kevlar vest (+100 armor)', price: 500, tag: 'ARMOR' });
+    } else if (id === 'burger') {
+      items.push({ id: 'burger', label: 'Burger Shot Combo', desc: '+40 health', price: 18 }, { id: 'burger2', label: 'Double Meat Combo', desc: 'Full health', price: 45 });
+    } else if (id === 'hospital') {
+      items.push({ id: 'heal', label: 'Emergency Treatment', desc: 'Restore full health', price: 150 });
+    } else if (id === 'garage') {
+      items.push({ id: 'repair', label: 'Full Repair', desc: 'Repair body & engine of nearby car', price: 250 });
+      for (const [n, c] of [['Midnight Black', 0x0b0b0e], ['Racing Red', 0xc41820], ['Electric Blue', 0x1368ff], ['Pearl White', 0xeeeeee], ['Sunset Orange', 0xff6a10], ['Toxic Green', 0x30d050], ['Hot Pink', 0xff2fa0], ['Gunmetal', 0x44484e]] as [string, number][]) items.push({ id: 'paint:' + c, label: `Respray — ${n}`, desc: 'Clearcoat respray', price: 120, tag: '#' + c.toString(16).padStart(6, '0') });
+      items.push({ id: 'nitro', label: 'Nitro Refill', desc: 'Fill the nitrous tank', price: 80 });
+    } else if (id === 'spray') {
+      items.push({ id: 'spraywash', label: 'Respray & Clear Wanted Level', desc: 'Only works if police are not watching', price: 600 });
+    } else if (id === 'dealer') {
+      for (const [k, n, price] of [['sports', 'Vortex GT', 62000], ['muscle', 'Brawler SS', 41000], ['suv', 'Titan XL', 38000], ['sedan', 'Marquis LX', 24000], ['pickup', 'Hauler 250', 32000]] as [string, string, number][]) items.push({ id: 'car:' + k, label: n, desc: 'Delivered to the lot outside', price });
+    } else if (id === 'home') {
+      items.push({ id: 'save', label: 'Save Game', desc: 'Progress is stored in your browser', price: 0 }, { id: 'sleep', label: 'Sleep until morning', desc: 'Skip to 07:00 and recover health', price: 0 });
+    }
+    void p;
+    const poi = this.world.pois.find((q) => q.id === id)!;
+    hud.shop = { id, title: poi.name, sub: id === 'garage' ? 'Your last car must be nearby' : `Cash ${fmtMoney(this.player.cash)}`, items };
+    emitHud();
+  }
+
+  closeShop() {
+    hud.shop = null;
+    emitHud();
+    if (hud.phase === 'playing') this.canvas.requestPointerLock();
+  }
+
+  buy(itemId: string) {
+    const shop = hud.shop;
+    if (!shop) return;
+    const item = shop.items.find((i) => i.id === itemId);
+    if (!item) return;
+    if (this.player.cash < item.price) { this.toast('Not enough cash', `You need ${fmtMoney(item.price)}`, 'bad'); this.audio.fail(); return; }
+    const pay = () => { this.player.cash -= item.price; this.audio.cash(); };
+    const car = this.player.vehicle ?? this.lastCar;
+    if (itemId.startsWith('w:')) {
+      const id = itemId.slice(2) as WeaponId; const d = WEAPONS[id];
+      const had = this.inv[id].have;
+      pay(); this.giveWeapon(id, had ? d.mag : d.mag * 2);
+      if (!had) this.selectWeapon(id);
+      this.toast(d.name, had ? 'Ammo purchased' : 'Purchased', 'good');
+    } else if (itemId === 'armor') { pay(); this.player.armor = 100; this.toast('Body Armor', 'Equipped', 'good'); }
+    else if (itemId === 'burger') { pay(); this.player.hp = Math.min(100, this.player.hp + 40); }
+    else if (itemId === 'burger2' || itemId === 'heal') { pay(); this.player.hp = 100; this.toast('Health', 'Fully restored', 'good'); }
+    else if (itemId === 'repair') { if (!car) return; pay(); car.repair(); this.toast('Garage', 'Car fully repaired', 'good'); }
+    else if (itemId.startsWith('paint:')) { if (!car) return; pay(); car.setColor(parseInt(itemId.slice(6))); this.toast('Garage', 'Fresh paint job', 'good'); }
+    else if (itemId === 'nitro') { if (!car) return; pay(); car.nitro = 1; }
+    else if (itemId === 'spraywash') {
+      if (!car) { this.toast('Pay\'n\'Spray', 'Drive in with a car first', 'bad'); return; }
+      if (this.police.unseenFor < 3 && this.wanted > 0) { this.toast('Pay\'n\'Spray', 'The cops are watching — lose them first!', 'bad'); return; }
+      pay(); car.repair(); car.setColor([0x1368ff, 0x30d050, 0xeeeeee, 0x111111, 0xc41820][Math.floor(Math.random() * 5)]);
+      this.setWanted(0, true); this.toast('Pay\'n\'Spray', 'Fresh paint. Heat is off.', 'good');
+    } else if (itemId.startsWith('car:')) {
+      pay();
+      const dealer = this.world.pois.find((q) => q.id === 'dealer')!;
+      const v = this.spawnCar(itemId.slice(4) as CarKind, 0x1c1d20 + Math.floor(Math.random() * 0xffffff) % 0x606060, dealer.x + 24, dealer.z + 2, Math.PI / 2, 'player');
+      this.ownedCars.push(itemId.slice(4));
+      v.role = 'parked';
+      this.toast('Premium Motors', `${v.spec.name} delivered outside`, 'good');
+    } else if (itemId === 'save') { this.saveGame(); this.toast('Saved', 'Progress saved', 'good'); }
+    else if (itemId === 'sleep') { this.sky.hour = 7; this.player.hp = 100; this.saveGame(); this.toast('Good morning', 'You slept well. Game saved.', 'good'); this.closeShop(); }
+    hud.cash = this.player.cash;
+    shop.sub = `Cash ${fmtMoney(this.player.cash)}`;
+    this.updateWeaponHud();
+    emitHud();
+  }
+
+  addCash(n: number) {
+    this.player.cash += n;
+    hud.cash = this.player.cash;
+    if (n >= 50) this.toast(n > 0 ? `+${fmtMoney(n)}` : fmtMoney(n), '', 'cash');
+  }
+
+  // =================================================================== combat
+  private updateWeapons(dt: number) {
+    const p = this.player;
+    const def = WEAPONS[this.weapon], inv = this.inv[this.weapon];
+    this.fireT -= dt;
+    if (this.reloadT > 0) {
+      this.reloadT -= dt;
+      if (this.reloadT <= 0) {
+        const take = Math.min(def.mag - inv.mag, inv.reserve);
+        inv.mag += take; inv.reserve -= take;
+        this.updateWeaponHud();
+      }
+    }
+    if (this.wm) {
+      const m = this.wm.flash.material as THREE.MeshBasicMaterial;
+      m.opacity = Math.max(0, m.opacity - dt * 22);
+    }
+    if (p.vehicle || this.state !== 'play' || hud.dialogue || hud.shop) return;
+    if (this.pressed('KeyR') && def.mag > 0 && inv.mag < def.mag && inv.reserve > 0 && this.reloadT <= 0) {
+      this.reloadT = def.reload;
+      this.audio.reload();
+      this.updateWeaponHud();
+    }
+    // melee
+    if (def.cls === 'none' || def.cls === 'melee') {
+      if (this.meleeT > 0) {
+        this.meleeT -= dt;
+        if (!this.meleeHit && this.meleeT < 0.2) { this.meleeHit = true; this.doMelee(def); }
+      }
+      if (this.mouseDown && this.fireT <= 0 && document.pointerLockElement === this.canvas) {
+        this.fireT = 1 / def.rate;
+        this.meleeT = 0.34; this.meleeHit = false;
+        this.playerHuman.punch();
+        this.audio.swing();
+      }
+      return;
+    }
+    if (!this.mouseDown || document.pointerLockElement !== this.canvas) return;
+    if (this.fireT > 0 || this.reloadT > 0) return;
+    if (!def.auto && this.heldLast) return;
+    if (inv.mag <= 0) {
+      this.audio.empty();
+      this.fireT = 0.3;
+      if (inv.reserve > 0) { this.reloadT = def.reload; this.audio.reload(); this.updateWeaponHud(); }
+      return;
+    }
+    this.fireT = 1 / def.rate;
+    inv.mag--;
+    this.fireWeapon(def);
+    this.updateWeaponHud();
+  }
+  private get heldLast() { return this.mouseDownPrev; }
+  private mouseDownPrev = false;
+
+  private fireWeapon(def: WeaponDef) {
+    const p = this.player;
+    this.lastShot = this.time;
+    this.playerHuman.shoot();
+    this.audio.gunshot(def.id, 1);
+    this.crowd.scareAround(p.x, p.z, 45 * def.loud);
+    this.crime(2, p.x, p.z);
+    // aim point from camera ray
+    const camDir = new THREE.Vector3(); this.camera.getWorldDirection(camDir);
+    const camPos = this.camera.position.clone();
+    const first = this.castRay(camPos.x, camPos.y, camPos.z, camDir.x, camDir.y, camDir.z, def.range + 20, { skipPlayer: true });
+    const aimPt = first.kind === 'none' ? camPos.clone().addScaledVector(camDir, 80) : camPos.clone().addScaledVector(camDir, first.t);
+    const muz = new THREE.Vector3();
+    if (this.wm) { this.wm.muzzle.updateWorldMatrix(true, false); this.wm.muzzle.getWorldPosition(muz); this.wm.flash.material instanceof THREE.MeshBasicMaterial && (this.wm.flash.material.opacity = 1); this.wm.flash.rotation.z = Math.random() * 6; }
+    else muz.set(p.x, p.y + 1.4, p.z);
+    if (def.explosive) { this.launchRocket(muz, aimPt, 'player'); this.camShake += 0.6; this.camPitch -= 0.04; return; }
+    const moving = Math.hypot(p.vx, p.vz) > 1;
+    const spread = def.spread * (p.aim ? 0.6 : 1.5) * (moving ? 1.4 : 1) * (p.crouch ? 0.7 : 1);
+    for (let i = 0; i < def.pellets; i++) {
+      const dir = aimPt.clone().sub(muz).normalize();
+      dir.x += (Math.random() - 0.5) * spread * 2; dir.y += (Math.random() - 0.5) * spread * 2; dir.z += (Math.random() - 0.5) * spread * 2;
+      dir.normalize();
+      this.bullet(muz, dir, def, 'player');
+    }
+    this.fx.muzzle(muz, camDir);
+    this.camPitch -= 0.006 * def.kick;
+    this.camYaw += (Math.random() - 0.5) * 0.004 * def.kick;
+    this.camShake += 0.04 * def.kick;
+  }
+
+  /** shared hitscan for player & npcs */
+  bullet(origin: THREE.Vector3, dir: THREE.Vector3, def: WeaponDef, from: 'player' | 'npc', shooter?: Npc) {
+    const r = this.castRay(origin.x, origin.y, origin.z, dir.x, dir.y, dir.z, def.range, { skipNpc: shooter, skipPlayer: from === 'player' });
+    const end = origin.clone().addScaledVector(dir, r.kind === 'none' ? Math.min(def.range, 120) : r.t);
+    if (def.pellets === 1 || Math.random() < 0.3) this.fx.tracer(origin.clone().addScaledVector(dir, 1.5), end);
+    const n = new THREE.Vector3(r.nx, r.ny, r.nz);
+    if (r.kind === 'npc' && r.npc) {
+      const killed = r.npc.hurt(def.dmg, this, origin.x, origin.z, !!r.head, from === 'player', 0);
+      this.fx.spark(end, n, 3, [0.8, 0.1, 0.1]);
+      if (from === 'player') { hud.hitMarker = killed ? 2 : 1; this.audio.hit(); }
+    } else if (r.kind === 'vehicle' && r.veh) {
+      r.veh.damage(def.dmg * 2.2);
+      this.fx.spark(end, n, 4);
+      if (from === 'player') { hud.hitMarker = 1; this.audio.hit(); const ai = r.veh.ai as { panic?: number } | null; if (ai) ai.panic = 8; if (r.veh.role === 'police') this.crime(3, r.veh.x, r.veh.z); }
+      if (r.veh === this.player.vehicle) this.damagePlayer(def.dmg * 0.4, origin.x, origin.z);
+    } else if (r.kind === 'world' || r.kind === 'ground') {
+      this.fx.spark(end, n, 4);
+      this.fx.hole(end, n);
+      if (r.kind === 'ground') this.fx.dust(end.x, end.y, end.z, 0, 0, 2);
+    } else if (r.kind === 'none') { /* miss */ }
+    // player hit?
+    if (from === 'npc') {
+      const p = this.player;
+      const px = p.vehicle ? p.vehicle.x : p.x, pz = p.vehicle ? p.vehicle.z : p.z;
+      const py = p.vehicle ? p.vehicle.y + 1 : p.y + 0.9;
+      const t = r.kind === 'none' ? def.range : r.t;
+      // closest approach of ray to player
+      const rx = px - origin.x, ry = py - origin.y, rz = pz - origin.z;
+      const proj = rx * dir.x + ry * dir.y + rz * dir.z;
+      if (proj > 0 && proj < t) {
+        const cx = rx - dir.x * proj, cy = ry - dir.y * proj, cz = rz - dir.z * proj;
+        if (Math.hypot(cx, cy, cz) < (p.vehicle ? 1.1 : 0.5)) {
+          this.damagePlayer(def.dmg * 0.4 * (p.vehicle ? 0.5 : 1), origin.x, origin.z);
+          this.fx.spark(new THREE.Vector3(px, py, pz), new THREE.Vector3(0, 1, 0), 2, [0.8, 0.1, 0.1]);
+        }
+      }
+      if (this.audio) this.audio.gunshot(def.id, clamp(1 - Math.hypot(origin.x - px, origin.z - pz) / 90, 0.1, 0.8));
+    }
+  }
+
+  npcShoot(n: Npc, def: WeaponDef) {
+    const p = this.player;
+    const origin = new THREE.Vector3();
+    if (n.wm) { n.wm.muzzle.updateWorldMatrix(true, false); n.wm.muzzle.getWorldPosition(origin); (n.wm.flash.material as THREE.MeshBasicMaterial).opacity = 1; }
+    else origin.set(n.x, n.y + 1.4, n.z);
+    n.human.shoot();
+    const tx = p.vehicle ? p.vehicle.x : p.x, tz = p.vehicle ? p.vehicle.z : p.z, ty = (p.vehicle ? p.vehicle.y + 1 : p.y + 1.1);
+    const dist = Math.hypot(tx - origin.x, tz - origin.z);
+    const sp = 0.02 + dist * 0.0018 + (n.role === 'gang' ? 0.03 : 0.01) + (p.vehicle ? Math.min(0.1, Math.abs(p.vehicle.speed) * 0.004) : Math.hypot(p.vx, p.vz) * 0.006);
+    const pellets = Math.min(def.pellets, 5);
+    for (let i = 0; i < pellets; i++) {
+      const d = new THREE.Vector3(tx - origin.x + (Math.random() - 0.5) * sp * dist * 2, ty - origin.y + (Math.random() - 0.5) * sp * dist * 1.2, tz - origin.z + (Math.random() - 0.5) * sp * dist * 2).normalize();
+      this.bullet(origin, d, { ...def, dmg: def.dmg * 0.8 }, 'npc', n);
+    }
+    this.fx.muzzle(origin, new THREE.Vector3(Math.sin(n.heading), 0, Math.cos(n.heading)));
+    this.crowd.scareAround(n.x, n.z, 40);
+  }
+
+  castRay(ox: number, oy: number, oz: number, dx: number, dy: number, dz: number, max: number, o: { skipNpc?: Npc; skipPlayer?: boolean } = {}): RayHit {
+    let best: RayHit = { t: max, kind: 'none', nx: 0, ny: 1, nz: 0 };
+    const tw = this.world.rayBoxes(ox, oy, oz, dx, dy, dz, max);
+    if (tw < best.t) {
+      // estimate normal from the dominant axis of the hit point relative to nearest box
+      const hx = ox + dx * tw, hz = oz + dz * tw;
+      let nx = -Math.sign(dx), nz = 0;
+      const e = 0.05;
+      const test = (x: number, z: number) => this.world.rayBoxes(x, oy + dy * tw, z, 0, 1, 0, 0.01) < 0.02 || this.world.rayBoxes(x, oy + dy * tw, z, 1, 0, 0, 0.001) < 0.0005;
+      void test; void e;
+      if (Math.abs(dz) > Math.abs(dx)) { nx = 0; nz = -Math.sign(dz); }
+      best = { t: tw, kind: 'world', nx, ny: 0, nz };
+      void hx; void hz;
+    }
+    if (dy < -1e-4) {
+      const tg = -oy / dy;
+      if (tg > 0 && tg < best.t) best = { t: tg, kind: 'ground', nx: 0, ny: 1, nz: 0 };
+    }
+    for (const n of this.crowd.list) {
+      if (!n.alive || n === o.skipNpc || Math.abs(n.x - ox) > max + 2 || Math.abs(n.z - oz) > max + 2) continue;
+      const fx = ox - n.x, fz = oz - n.z;
+      const A = dx * dx + dz * dz, B = 2 * (fx * dx + fz * dz), Cq = fx * fx + fz * fz - 0.34 * 0.34;
+      const disc = B * B - 4 * A * Cq;
+      if (disc < 0 || A < 1e-8) continue;
+      const t = (-B - Math.sqrt(disc)) / (2 * A);
+      if (t < 0 || t > best.t) continue;
+      const y = oy + dy * t;
+      const sc = n.human.height;
+      if (y < n.y - 0.05 || y > n.y + 1.85 * sc) continue;
+      best = { t, kind: 'npc', npc: n, head: y > n.y + 1.52 * sc, nx: -dx, ny: 0, nz: -dz };
+    }
+    for (const v of this.vehicles) {
+      if (v.wrecked && v.exploded && false) continue;
+      if (Math.abs(v.x - ox) > max + 6 || Math.abs(v.z - oz) > max + 6) continue;
+      if (v === this.player.vehicle && o.skipPlayer) continue;
+      const c = Math.cos(v.heading), s = Math.sin(v.heading);
+      const lox = (ox - v.x) * c - (oz - v.z) * s, loz = (ox - v.x) * s + (oz - v.z) * c;
+      const ldx = dx * c - dz * s, ldz = dx * s + dz * c;
+      let t0 = 0, t1 = best.t;
+      const hw = v.spec.W / 2, hl = v.spec.L / 2;
+      const slab = (o2: number, d: number, mn: number, mx: number) => {
+        if (Math.abs(d) < 1e-8) return o2 >= mn && o2 <= mx;
+        let a = (mn - o2) / d, b = (mx - o2) / d;
+        if (a > b) [a, b] = [b, a];
+        t0 = Math.max(t0, a); t1 = Math.min(t1, b);
+        return t0 <= t1;
+      };
+      if (slab(lox, ldx, -hw, hw) && slab(oy - v.y, dy, 0.2, v.spec.H) && slab(loz, ldz, -hl, hl) && t0 < best.t) best = { t: t0, kind: 'vehicle', veh: v, nx: -dx, ny: 0.3, nz: -dz };
+    }
+    return best;
+  }
+
+  private doMelee(def: WeaponDef) {
+    const p = this.player;
+    let hitAny = false;
+    const fx = Math.sin(p.heading), fz = Math.cos(p.heading);
+    this.crime(1, p.x, p.z);
+    for (const n of this.crowd.list) {
+      if (!n.alive) continue;
+      const dx = n.x - p.x, dz = n.z - p.z;
+      const d = Math.hypot(dx, dz);
+      if (d > def.range + 0.4 || (dx * fx + dz * fz) / (d || 1) < 0.25) continue;
+      n.hurt(def.dmg, this, p.x, p.z, false, true, 5);
+      n.human.flinch();
+      hitAny = true;
+      this.fx.spark(new THREE.Vector3(n.x, n.y + 1.3, n.z), new THREE.Vector3(-fx, 0.2, -fz), 2, [0.9, 0.3, 0.2]);
+      if (n.role === 'cop' || n.role === 'swat') this.crime(4, n.x, n.z);
+    }
+    if (hitAny) { this.audio.punch(); hud.hitMarker = 1; this.camShake += 0.1; }
+  }
+
+  private launchRocket(from: THREE.Vector3, to: THREE.Vector3, owner: 'player' | 'npc') {
+    const mesh = new THREE.Mesh(new THREE.CylinderGeometry(0.06, 0.06, 0.7, 8), new THREE.MeshStandardMaterial({ color: 0x555a50, metalness: 0.7, roughness: 0.4 }));
+    mesh.geometry.rotateX(Math.PI / 2);
+    this.scene.add(mesh);
+    const v = to.clone().sub(from).normalize().multiplyScalar(70);
+    this.projs.push({ mesh, p: from.clone(), v, life: 4, from: owner });
+    this.audio.gunshot('rpg');
+  }
+
+  private updateProjectiles(dt: number) {
+    for (let i = this.projs.length - 1; i >= 0; i--) {
+      const q = this.projs[i];
+      q.life -= dt;
+      const step = q.v.clone().multiplyScalar(dt);
+      const len = step.length();
+      const dir = step.clone().normalize();
+      const r = this.castRay(q.p.x, q.p.y, q.p.z, dir.x, dir.y, dir.z, len + 0.3, { skipPlayer: q.life > 3.6 });
+      q.p.add(step);
+      q.mesh.position.copy(q.p);
+      q.mesh.lookAt(q.p.clone().add(q.v));
+      this.fx.smoke.emit(q.p.x, q.p.y, q.p.z, 0, 0.3, 0, 1.2, 0.3, 1.6, 0.8, 0.8, 0.8, 0.5, 0, 0.98);
+      this.fx.glow.emit(q.p.x, q.p.y, q.p.z, 0, 0, 0, 0.12, 0.5, 0.1, 1, 0.6, 0.2, 1);
+      if (r.kind !== 'none' || q.life <= 0 || q.p.y < 0.05) {
+        this.explodeAt(q.p.x, Math.max(q.p.y, 0.3), q.p.z, 11, 260, q.from);
+        this.scene.remove(q.mesh);
+        this.projs.splice(i, 1);
+      }
+    }
+  }
+
+  explodeAt(x: number, y: number, z: number, radius: number, dmg: number, src: 'player' | 'npc' | 'veh') {
+    this.fx.explosion(x, y, z, radius > 8 ? 1.2 : 0.9);
+    const pd = Math.hypot(x - this.player.x, z - this.player.z);
+    this.audio.explosion(pd);
+    this.camShake += clamp(1 - pd / 80, 0, 1) * 1.2;
+    this.crowd.scareAround(x, z, 70);
+    for (const n of this.crowd.list) {
+      if (!n.alive) continue;
+      const d = Math.hypot(n.x - x, n.z - z);
+      if (d < radius * 1.3) n.hurt(dmg * (1 - d / (radius * 1.3)) * 1.5, this, x, z, false, src === 'player', 14 * (1 - d / radius));
+    }
+    for (const v of this.vehicles) {
+      const d = Math.hypot(v.x - x, v.z - z);
+      if (d < radius * 1.6) {
+        const k = 1 - d / (radius * 1.6);
+        v.damage(dmg * k * 3);
+        const l = d || 1;
+        v.vx += ((v.x - x) / l) * 16 * k; v.vz += ((v.z - z) / l) * 16 * k;
+        if (v.vy < 1 && k > 0.3) v.vy = 6 * k;
+        if (src === 'player' && v.role === 'police') this.crime(3, x, z);
+      }
+    }
+    const pdist = this.player.vehicle ? Math.hypot(this.player.vehicle.x - x, this.player.vehicle.z - z) : pd;
+    if (pdist < radius * 1.3) this.damagePlayer(dmg * 0.5 * (1 - pdist / (radius * 1.3)), x, z);
+    if (src === 'player') this.crime(3, x, z);
+  }
+
+  onVehicleExplode(v: Vehicle) {
+    this.explodeAt(v.x, v.y + 0.6, v.z, 9, 150, v.role === 'player' || this.lastCar === v ? 'player' : 'veh');
+    this.fx.debrisBurst(v.x, v.y, v.z, v.color, 12);
+    if (v === this.player.vehicle) {
+      this.exitVehicle();
+      this.damagePlayer(70, v.x, v.z);
+      this.player.vy = 7;
+      this.player.onGround = false;
+    }
+  }
+
+  onVehicleCrash(v: Vehicle, impact: number, x: number, z: number) {
+    const d = Math.hypot(x - this.player.x, z - this.player.z);
+    if (d < 120) this.audio.crash(impact * clamp(1 - d / 120, 0.2, 1));
+    this.fx.spark(new THREE.Vector3(x, 0.6, z), new THREE.Vector3(0, 1, 0), Math.min(12, Math.floor(impact)), [1, 0.8, 0.4]);
+    if (impact > 7) this.fx.debrisBurst(x, 0.5, z, v.color, Math.floor(impact / 4));
+    if (v === this.player.vehicle) {
+      this.camShake += clamp(impact / 20, 0, 0.8);
+      if (impact > 11) this.damagePlayer((impact - 11) * 2.2, x, z);
+    }
+    if (impact > 5) this.crowd.scareAround(x, z, 22);
+    void v;
+  }
+
+  onNpcHurtByPlayer(n: Npc) {
+    if (n.role === 'cop' || n.role === 'swat') this.crime(4, n.x, n.z);
+    else if (n.role === 'ped') this.crime(1, n.x, n.z);
+  }
+
+  onNpcKilled(n: Npc, byPlayer: boolean) {
+    if (n.cash > 0 || n.role === 'gang') this.dropCash(n.x, n.z, n.cash || 40 + Math.floor(Math.random() * 120));
+    if (byPlayer) {
+      hud.stats.kills++;
+      if (n.role === 'cop') { this.crime(5, n.x, n.z); }
+      else if (n.role === 'swat') this.crime(5, n.x, n.z);
+      else if (n.role === 'ped') this.crime(3, n.x, n.z);
+      hud.hitMarker = 2;
+    }
+    this.crowd.scareAround(n.x, n.z, 30);
+  }
+
+  dropCash(x: number, z: number, amt: number) {
+    const mesh = new THREE.Mesh(new THREE.BoxGeometry(0.34, 0.06, 0.18), new THREE.MeshStandardMaterial({ color: 0x4acb6a, emissive: 0x1a6a2a, emissiveIntensity: 0.6, roughness: 0.5 }));
+    mesh.position.set(x, 0.6, z);
+    this.scene.add(mesh);
+    this.pickups.push({ mesh, x, z, amt, t: 60 });
+  }
+
+  // ---------------------------------------------------------------- crime & wanted
+  private witnessed(x: number, z: number) {
+    for (const n of this.crowd.list) {
+      if (!n.alive) continue;
+      const d = Math.hypot(n.x - x, n.z - z);
+      if ((n.role === 'cop' || n.role === 'swat') && d < 70) return 2;
+      if (n.role === 'ped' && d < 22 && Math.random() < 0.02) return 1;
+    }
+    for (const v of this.police.cars) if (Math.hypot(v.x - x, v.z - z) < 70) return 2;
+    for (const v of this.vehicles) if (v.role === 'police' && Math.hypot(v.x - x, v.z - z) < 60) return 2;
+    return 0;
+  }
+  crime(sev: number, x: number, z: number) {
+    if (this.state !== 'play') return;
+    if (this.flags.noWanted) return;
+    const w = this.witnessed(x, z);
+    if (!w && sev < 3) return;
+    if (!w && Math.random() > 0.35) return;
+    const map = [0, 1, 1, 2, 3, 4];
+    const target = map[Math.min(5, sev)];
+    if (target > this.wanted) this.setWanted(target);
+    else if (sev >= 4 && this.wanted < 5 && Math.random() < 0.4) this.setWanted(this.wanted + 1);
+  }
+  setWanted(n: number, silent = false) {
+    n = clamp(n, 0, 5);
+    if (n > this.wanted && !silent) { this.audio.wanted(); this.toast('WANTED', '★'.repeat(n), 'bad'); }
+    if (n < this.wanted && n === 0) this.toast('Wanted level cleared', 'You lost the cops', 'good');
+    this.wanted = n;
+    hud.wanted = n;
+    if (n === 0) hud.evading = false;
+    emitHud();
+  }
+  busted() {
+    if (this.state !== 'play') return;
+    this.state = 'busted';
+    hud.overlay = 'busted'; hud.overlayText = 'BUSTED';
+    this.respawnT = 4;
+    this.audio.fail();
+    if (this.missionRunning) this.abortMission('You were arrested');
+    emitHud();
+  }
+  damagePlayer(n: number, sx: number, sz: number) {
+    if (this.state !== 'play' || this.flags.god) return;
+    const p = this.player;
+    if (p.armor > 0) { const a = Math.min(p.armor, n * 0.65); p.armor -= a; n -= a; }
+    p.hp -= n;
+    this.lastDamage = this.time;
+    hud.damage = Math.min(1, hud.damage + n / 40);
+    if (n > 3) this.audio.hurt();
+    void sx; void sz;
+    if (p.hp <= 0) { p.hp = 0; this.wasted(); }
+  }
+  wasted() {
+    if (this.state !== 'play') return;
+    this.state = 'dead';
+    if (this.player.vehicle) this.exitVehicle();
+    this.playerHuman.die();
+    hud.overlay = 'wasted'; hud.overlayText = 'WASTED';
+    this.respawnT = 4.2;
+    this.slowmo = 0.35;
+    this.audio.fail();
+    if (this.missionRunning) this.abortMission('You died');
+    emitHud();
+  }
+  respawn() {
+    const arrested = this.state === 'busted';
+    const poi = this.world.pois.find((q) => q.id === (arrested ? 'police' : 'hospital'))!;
+    const p = this.player;
+    const fine = Math.min(p.cash, Math.floor(200 + p.cash * 0.08));
+    p.cash -= fine;
+    hud.cash = p.cash;
+    if (arrested) {
+      for (const id of WEAPON_ORDER) if (id !== 'fists' && id !== 'bat') { this.inv[id].mag = 0; this.inv[id].reserve = Math.floor(this.inv[id].reserve * 0.3); }
+      this.toast('Released', `Fine paid ${fmtMoney(fine)}. Ammo confiscated.`, 'bad');
+    } else this.toast('Discharged', `Hospital bill ${fmtMoney(fine)}`, 'bad');
+    p.x = poi.x + 2; p.z = poi.z - 2; p.y = this.world.groundY(p.x, p.z); p.hp = 100; p.vx = p.vz = 0;
+    this.playerHuman.revive();
+    this.playerHuman.root.rotation.set(0, 0, 0);
+    this.setWanted(0, true);
+    this.slowmo = 1;
+    this.state = 'play';
+    hud.overlay = null;
+    this.police.cleanup(0);
+    this.selectWeapon('fists');
+    this.selectWeapon(this.inv.pistol.have ? 'pistol' : 'fists');
+    this.camYaw = Math.PI;
+    emitHud();
+  }
+
+  // =================================================================== world update
+  private updateWorld(dt: number, night: number) {
+    if (this.state !== 'menu' || true) {
+      this.crowd.update(dt);
+      this.traffic.update(dt);
+      this.police.update(dt);
+    }
+    this.updateProjectiles(dt);
+    // player vehicle physics
+    const pv = this.player.vehicle;
+    for (const v of this.vehicles) {
+      if (v === pv || v.role === 'traffic' || v.role === 'police' && this.traffic.list.includes(v) || v.role === 'swat' && this.traffic.list.includes(v)) continue;
+      v.update(dt, this.world, night);
+    }
+    if (pv) pv.update(dt, this.world, night);
+    // vehicle-vehicle collisions
+    const vs = this.vehicles;
+    for (let i = 0; i < vs.length; i++) {
+      const a = vs[i];
+      for (let j = i + 1; j < vs.length; j++) {
+        const b = vs[j];
+        if (Math.abs(a.x - b.x) > 6 || Math.abs(a.z - b.z) > 6) continue;
+        this.collideCars(a, b);
+      }
+    }
+    // vehicles hitting NPCs
+    for (const v of vs) {
+      if (Math.abs(v.speed) < 2.8 || v.wrecked) continue;
+      for (const n of this.crowd.list) {
+        if (!n.alive || Math.abs(n.x - v.x) > 4 || Math.abs(n.z - v.z) > 4) continue;
+        const rel = this.toLocal(v, n.x, n.z);
+        if (Math.abs(rel.x) < v.spec.W / 2 + 0.35 && Math.abs(rel.z) < v.spec.L / 2 + 0.3) {
+          const byPlayer = v === pv;
+          n.hurt(Math.abs(v.speed) * 6, this, v.x, v.z, false, byPlayer, Math.abs(v.speed) * 0.7);
+          if (byPlayer) { this.audio.hit(); this.crime(1, n.x, n.z); }
+          this.camShake += byPlayer ? 0.12 : 0;
+        }
+      }
+    }
+    // effects tied to vehicles
+    for (const v of vs) {
+      const dd = Math.hypot(v.x - this.player.x, v.z - this.player.z);
+      if (dd > 140) continue;
+      if (v.health < 450 && !v.exploded || v.wrecked) {
+        const heat = v.wrecked ? 0.8 : v.burning;
+        if (Math.random() < dt * 22) {
+          const f = v.fwd();
+          this.fx.carSmoke(v.x + f.x * (v.spec.zf - 0.2), v.y + 0.95, v.z + f.z * (v.spec.zf - 0.2), v.wrecked ? 0.9 : heat);
+        }
+      }
+      if (v.skid && dd < 90) {
+        const f = v.fwd();
+        for (const w of v.model.wheels) {
+          if (w.front && Math.abs(v.slip) < 4) continue;
+          const wz = w.pivot.position.z, wx = w.pivot.position.x;
+          const px = v.x + f.x * wz + -f.z * wx, pz = v.z + f.z * wz + f.x * wx;
+          if (Math.random() < dt * 40) this.fx.tyreSmoke(px, v.y, pz, v.vx, v.vz);
+          if (Math.random() < dt * 60) this.fx.skid(px, v.y, pz, v.heading + Math.atan2(v.slip, Math.abs(v.speed)) * 0);
+        }
+      }
+      if (v.boosting) {
+        const f = v.fwd();
+        for (const e of v.model.exhaust) {
+          const ex = v.x + f.x * e.z - f.z * e.x, ez = v.z + f.z * e.z + f.x * e.x;
+          this.fx.glow.emit(ex, v.y + 0.35, ez, -f.x * 4, 0.2, -f.z * 4, 0.18, 0.7, 0.1, 0.4, 0.6, 1, 1);
+        }
+      }
+    }
+    // wanted: decay timers are in police
+    // mission timer
+    if (this.missionTimer && !this.paused) {
+      this.missionTimer.t -= dt;
+      if (this.missionTimer.t <= 0) { const cb = this.missionTimer.onEnd; this.missionTimer = null; cb?.(); }
+    }
+  }
+
+  private collideCars(a: Vehicle, b: Vehicle) {
+    const ca = this.carCircles(a), cb = this.carCircles(b);
+    let hit = false, imp = 0;
+    for (const p of ca) for (const q of cb) {
+      const dx = q.x - p.x, dz = q.z - p.z;
+      const rr = p.r + q.r;
+      const d2 = dx * dx + dz * dz;
+      if (d2 >= rr * rr || d2 < 1e-6) continue;
+      const d = Math.sqrt(d2);
+      const nx = dx / d, nz = dz / d;
+      const depth = rr - d;
+      const ma = a.mass, mb = b.mass;
+      const ra = mb / (ma + mb), rb = ma / (ma + mb);
+      const i1 = a.bump(-nx, -nz, depth * 0.55, b.vx, b.vz, ra);
+      const i2 = b.bump(nx, nz, depth * 0.55, a.vx, a.vz, rb);
+      imp = Math.max(imp, i1, i2);
+      hit = true;
+    }
+    if (hit && imp > 2.5) {
+      const now = performance.now();
+      const last = (a as unknown as { _cc?: number })._cc ?? 0;
+      if (now - last < 250) return;
+      (a as unknown as { _cc: number })._cc = now;
+      a.damage(imp * 7 * (b.mass / (a.mass + b.mass)) * 2);
+      b.damage(imp * 7 * (a.mass / (a.mass + b.mass)) * 2);
+      this.onVehicleCrash(a, imp, (a.x + b.x) / 2, (a.z + b.z) / 2);
+      const ai = (v: Vehicle) => v.ai as { panic?: number } | null;
+      if (a === this.player.vehicle || b === this.player.vehicle) {
+        const other = a === this.player.vehicle ? b : a;
+        const o = ai(other); if (o) o.panic = 6;
+        if (other.role === 'police' || other.role === 'swat') { if (this.wanted === 0) this.crime(3, other.x, other.z); }
+        this.crime(1, other.x, other.z);
+      }
+    }
+  }
+  private carCircles(v: Vehicle) {
+    const f = v.fwd();
+    const o = v.spec.L / 2 - v.spec.W / 2 - 0.1;
+    const r = v.spec.W / 2 + 0.08;
+    return [{ x: v.x + f.x * o, z: v.z + f.z * o, r }, { x: v.x, z: v.z, r }, { x: v.x - f.x * o, z: v.z - f.z * o, r }];
+  }
+
+  playerNear(v: Vehicle, d: number) {
+    return Math.hypot(v.x - this.player.x, v.z - this.player.z) < d;
+  }
+
+  // =================================================================== camera
+  private updateCamera(dt: number, snap = false) {
+    const cam = this.camera;
+    const p = this.player;
+    const veh = p.vehicle;
+    let tx = p.x, ty = p.y + 1.45, tz = p.z;
+    let wantFov = 62;
+    if (this.state === 'menu') {
+      // slow orbit around Veer and his car
+      const a = this.menuT * 0.22 + 0.6;
+      const c = this.lastCar!;
+      const cx = (p.x + c.x) / 2, cz = (p.z + c.z) / 2;
+      cam.position.set(cx + Math.cos(a) * 6.4, 1.5 + Math.sin(this.menuT * 0.3) * 0.2, cz + Math.sin(a) * 6.4);
+      cam.lookAt(p.x * 0.6 + c.x * 0.4, 1.15, p.z * 0.6 + c.z * 0.4);
+      cam.fov = 38; cam.updateProjectionMatrix();
+      return;
+    }
+    if (this.cinematicCam) {
+      const c = this.cinematicCam;
+      c.t += dt;
+      const k = clamp(c.t / c.dur, 0, 1);
+      cam.position.lerpVectors(c.from, c.to, k * k * (3 - 2 * k));
+      cam.lookAt(c.look);
+      if (c.t > c.dur + 0.5) this.cinematicCam = null;
+      return;
+    }
+    if (this.dialogNpc && hud.dialogue) {
+      const n = this.dialogNpc;
+      const dx = n.x - p.x, dz = n.z - p.z;
+      const d = Math.hypot(dx, dz) || 1;
+      const ux = dx / d, uz = dz / d;
+      const desired = new THREE.Vector3(p.x - ux * 1.0 - uz * 0.9, p.y + 1.55, p.z - uz * 1.0 + ux * 0.9);
+      cam.position.lerp(desired, snap ? 1 : 1 - Math.exp(-dt * 3));
+      cam.lookAt(n.x - ux * 0.0, n.y + 1.6, n.z);
+      cam.fov = damp(cam.fov, 42, 4, dt); cam.updateProjectionMatrix();
+      return;
+    }
+    if (veh) {
+      const sp = Math.abs(veh.speed);
+      // auto-recenter behind car unless the user recently moved the mouse
+      const lookBack = this.down('KeyC');
+      if (this.camLookT <= 0) this.camYaw = dampAngle(this.camYaw, veh.heading + (lookBack ? Math.PI : 0), 3.4, dt);
+      this.camPitch = damp(this.camPitch, 0.16 + clamp(sp / 120, 0, 0.1), 2, dt);
+      tx = veh.x; ty = veh.y + 1.3; tz = veh.z;
+      this.camDist = damp(this.camDist, veh.spec.L * 1.35 + 2.2 + sp * 0.06, 3, dt);
+      wantFov = 62 + clamp(sp * 0.55, 0, 24) + (veh.boosting ? 12 : 0);
+    } else {
+      const aim = p.aim;
+      this.camDist = damp(this.camDist, aim ? 2.2 : this.playerHs.stance === 'crouch' ? 3.4 : 4.3, 8, dt);
+      wantFov = aim ? 48 : 62 + clamp(Math.hypot(p.vx, p.vz) * 0.9, 0, 6);
+      if (aim) {
+        const r = { x: -Math.cos(this.camYaw), z: Math.sin(this.camYaw) };
+        tx += r.x * 0.75; tz += r.z * 0.75; ty -= 0.05;
+      }
+    }
+    const cp = Math.cos(this.camPitch), sp2 = Math.sin(this.camPitch);
+    const dirx = -Math.sin(this.camYaw) * cp, diry = sp2, dirz = -Math.cos(this.camYaw) * cp;
+    // camera collision
+    let dist = this.camDist;
+    const hitT = this.world.rayBoxes(tx, ty, tz, dirx, diry, dirz, dist + 0.3);
+    if (hitT < dist + 0.3) dist = Math.max(0.6, hitT - 0.3);
+    let cx = tx + dirx * dist, cy = ty + diry * dist, cz = tz + dirz * dist;
+    const gy = this.world.groundY(cx, cz);
+    cy = Math.max(cy, gy + 0.3);
+    const shake = (this.camShake + this.fx.shake * 0.5);
+    this.camShake = Math.max(0, this.camShake - dt * 2.2);
+    cx += (Math.random() - 0.5) * shake * 0.12; cy += (Math.random() - 0.5) * shake * 0.12;
+    if (snap) cam.position.set(cx, cy, cz);
+    else {
+      const k = veh ? 1 - Math.exp(-dt * 14) : 1 - Math.exp(-dt * 22);
+      cam.position.x += (cx - cam.position.x) * k; cam.position.y += (cy - cam.position.y) * k; cam.position.z += (cz - cam.position.z) * k;
+    }
+    cam.lookAt(tx, ty + (veh ? 0.0 : 0), tz);
+    cam.fov = damp(cam.fov, wantFov, 5, dt);
+    cam.updateProjectionMatrix();
+  }
+
+  cinematic(from: THREE.Vector3, to: THREE.Vector3, look: THREE.Vector3, dur: number) {
+    this.cinematicCam = { from, to, look, t: 0, dur };
+  }
+
+  // =================================================================== audio sync
+  private updateAudio(dt: number) {
+    const a = this.audio;
+    if (!a.ctx) return;
+    const v = this.player.vehicle;
+    if (v) {
+      a.engine(!v.wrecked, v.speed, v.spec.top, v.ctl.throttle, v.boosting, v.kind);
+      a.skid(v.skid ? clamp(v.slip / 8 + (v.ctl.hand ? 0.4 : 0), 0.2, 1) : 0);
+      a.hornOn(v.horn);
+      a.musicGain.gain.setTargetAtTime(this.audio.musicVol * 0.5, a.ctx.currentTime, 0.3);
+    } else {
+      a.noEngine(); a.skid(0); a.hornOn(false);
+      a.musicGain.gain.setTargetAtTime(this.audio.musicVol * 0.08, a.ctx.currentTime, 0.3);
+    }
+    // siren: nearest police with siren
+    let near = 1e9;
+    for (const c of this.vehicles) if (c.sirenOn && !c.wrecked) near = Math.min(near, Math.hypot(c.x - this.player.x, c.z - this.player.z));
+    a.sirenOn(near < 200, clamp(1 - near / 200, 0, 1));
+    if (this.police.heli.active && Math.random() < dt * 8) a.heli();
+    a.ambience(this.sky.rain, this.sky.night, this.world.onRoad(this.player.x, this.player.z) ? 1 : 0.4);
+    if (this.mapT === 0) void 0;
+  }
+
+  // =================================================================== waiters (story)
+  private updateWaiters() {
+    for (let i = this.waiters.length - 1; i >= 0; i--) {
+      const w = this.waiters[i];
+      if (this.missionAbort) { this.waiters.splice(i, 1); w.reject(new MissionFail(this.missionAbort.reason)); continue; }
+      let ok = false;
+      try { ok = w.cond(); } catch (e) { this.waiters.splice(i, 1); w.reject(e); continue; }
+      if (ok) { this.waiters.splice(i, 1); w.resolve(); }
+    }
+  }
+  waitFor(cond: () => boolean) {
+    return new Promise<void>((resolve, reject) => {
+      if (this.missionAbort) return reject(new MissionFail(this.missionAbort.reason));
+      this.waiters.push({ cond, resolve, reject });
+    });
+  }
+  sleep(sec: number) {
+    const end = this.time + sec;
+    return this.waitFor(() => this.time >= end);
+  }
+
+  // =================================================================== dialogue
+  private dlgId = 1;
+  say(who: string, text: string, opts: { auto?: boolean; role?: string } = {}): Promise<void> {
+    return new Promise((resolve, reject) => {
+      const id = this.dlgId++;
+      const role = opts.role ?? 'talk';
+      const auto = opts.auto ?? false;
+      if (auto) {
+        hud.subtitle = { who, text };
+        emitHud();
+        const dur = 1.8 + text.length * 0.05;
+        const end = this.time + dur;
+        this.audio.dialogue();
+        this.waitFor(() => this.time >= end).then(() => { if (hud.subtitle?.text === text) hud.subtitle = null; emitHud(); resolve(); }, reject);
         return;
       }
-      this.tidx++;
-    }
-    const want = Math.atan2(dx, dz);
-    const diff = angDiff(t.heading, want);
-    const steer = clamp(-diff * 2.4, -1, 1);
-    let vt = Math.abs(diff) > 0.45 ? 7 : 13;
-    const dp = Math.hypot(t.x - this.px, t.z - this.pz);
-    if (dp > 40) vt = Math.min(vt, 8);
-    if (dp > 75) vt = Math.min(vt, 4.5);
-    if (last) vt = Math.min(vt, dist * 0.6 + 2);
-    const throttle = clamp((vt - t.speed) * 0.6, -1, 1);
-    t.update(dt, { throttle, steer, hand: false, boost: false }, this.city);
+      hud.dialogue = { who, text, choices: null, role, id };
+      emitHud();
+      this.audio.dialogue();
+      let done = false;
+      let t0 = this.time;
+      const finish = () => { if (done) return; if (this.time - t0 < 0.25) return; done = true; this.dialogueAdvance = null; hud.dialogue = null; emitHud(); resolve(); };
+      this.dialogueAdvance = finish;
+      this.waitFor(() => done).catch((e) => { hud.dialogue = null; this.dialogueAdvance = null; emitHud(); reject(e); });
+      t0 = this.time;
+    });
   }
-
-  private updateNpcs(dt: number) {
-    for (const k in this.npcs) {
-      const n = this.npcs[k];
-      if (!n.on) continue;
-      const want = Math.atan2(this.px - n.x, this.pz - n.z);
-      n.h.root.rotation.y += angDiff(n.h.root.rotation.y, want) * (1 - Math.exp(-dt * 4));
-      n.h.update(dt, { speed: 0, air: false, sit: false, steer: 0 });
-    }
+  ask(who: string, text: string, choices: string[]): Promise<number> {
+    return new Promise((resolve, reject) => {
+      const id = this.dlgId++;
+      hud.dialogue = { who, text, choices: choices.map((c, i) => ({ id: i, label: c })), role: 'ask', id };
+      emitHud();
+      let picked = -1;
+      this.dialogueChoose = (i) => { if (picked >= 0) return; picked = i; this.dialogueChoose = null; hud.dialogue = null; emitHud(); this.audio.click(); resolve(i); };
+      this.waitFor(() => picked >= 0).catch((e) => { hud.dialogue = null; this.dialogueChoose = null; emitHud(); reject(e); });
+    });
   }
+  chooseDialogue(i: number) { this.dialogueChoose?.(i); }
 
-  private updateDialogue(dt: number) {
-    if (this.curLine) {
-      this.lineT -= dt;
-      if (this.lineT <= 0) {
-        this.curLine = null;
-        this.hud.subtitle = null;
-        this.emit(true);
+  // =================================================================== missions API
+  refreshMissionList() {
+    hud.missions = MISSIONS.map((m, i) => ({ id: i, title: m.title, done: this.completed.has(i), active: this.missionRunning && this.missionIndex === i }));
+  }
+  startMission(i: number) {
+    if (i >= MISSIONS.length || this.missionRunning) return;
+    this.missionIndex = i;
+    const m = MISSIONS[i];
+    this.missionRunning = true;
+    this.missionAbort = null;
+    hud.missionTitle = m.title;
+    this.refreshMissionList();
+    emitHud();
+    void (async () => {
+      try {
+        await m.run(this);
+        this.completed.add(i);
+        this.missionIndex = i + 1;
+        hud.stats.missions++;
+        this.addCash(m.reward);
+        this.audio.complete();
+        hud.overlay = i === MISSIONS.length - 1 ? 'ending' : 'passed';
+        hud.overlayText = m.title;
+        emitHud();
+        this.saveGame();
+        await new Promise((r) => setTimeout(r, i === MISSIONS.length - 1 ? 7000 : 3600));
+        if (hud.overlay === 'passed' || hud.overlay === 'ending') hud.overlay = null;
+      } catch (e) {
+        if (!(e instanceof MissionFail)) console.error(e);
+        else {
+          this.audio.fail();
+          if (e.message && this.state === 'play') { hud.overlay = 'failed'; hud.overlayText = e.message; emitHud(); await new Promise((r) => setTimeout(r, 3000)); if (hud.overlay === 'failed') hud.overlay = null; }
+        }
       }
-    }
-    if (!this.curLine && this.queue.length) {
-      const l = this.queue.shift()!;
-      this.curLine = l;
-      this.lineT = 1.8 + l.text.length * 0.05;
-      this.hud.subtitle = { who: l.who, text: l.text };
-      this.audio.talk(l.who);
-      this.emit(true);
-    }
+      this.cleanupMission();
+      this.missionRunning = false;
+      this.refreshMissionList();
+      // next mission auto-starts once the previous is completed and player continues
+      emitHud();
+      if (this.completed.has(i) && i + 1 < MISSIONS.length) setTimeout(() => this.startMission(i + 1), 800);
+      else if (!this.completed.has(i) && this.state === 'play') setTimeout(() => { if (!this.missionRunning) this.startMission(this.missionIndex); }, 600);
+    })();
+  }
+  abortMission(reason: string) { this.missionAbort = { reason }; }
+  cleanupMission() {
+    this.missionAbort = null;
+    this.markers = [];
+    hud.objective = null; hud.objDist = null; hud.missionTitle = null; hud.timer = null; hud.lost = null; hud.dialogue = null; hud.subtitle = null; hud.cinematic = false;
+    this.missionTimer = null;
+    this.dialogNpc = null;
+    this.story?.cleanup();
+    if (this.state === 'cinematic') this.state = 'play';
+  }
+  setObjective(text: string | null, markers: Marker[] = []) {
+    hud.objective = text;
+    this.markers = markers;
+    emitHud();
+  }
+  startTimer(sec: number, label: string, onEnd?: () => void) { this.missionTimer = { t: sec, label, onEnd }; }
+  stopTimer() { this.missionTimer = null; hud.timer = null; }
+  teleportPlayer(x: number, z: number, h = 0) {
+    if (this.player.vehicle) this.exitVehicle();
+    this.player.x = x; this.player.z = z; this.player.heading = h; this.player.y = this.world.groundY(x, z);
+    this.camYaw = h;
+  }
+  setCinematic(on: boolean) { hud.cinematic = on; emitHud(); }
+  fadeTo(on: boolean) { hud.fade = on; emitHud(); }
+  distTo(x: number, z: number) {
+    const p = this.player;
+    return Math.hypot(x - (p.vehicle ? p.vehicle.x : p.x), z - (p.vehicle ? p.vehicle.z : p.z));
   }
 
-  // ------------------------------------------------------------------ camera
-  private updateCamera(dt: number, sprint: boolean) {
-    const cam = this.camera;
-    let tx: number, ty: number, tz: number, dist: number;
-    if (this.inCar) {
-      const sp = this.car.speed;
-      tx = this.car.x;
-      ty = this.car.y + 1.45;
-      tz = this.car.z;
-      dist = 7.4 + Math.min(3.4, Math.abs(sp) * 0.07);
-      if (sp > 3 && this.time - this.lastMouse > 1.1) {
-        this.camYaw += angDiff(this.camYaw, this.car.heading) * (1 - Math.exp(-dt * 2.2));
-        this.camPitch += (0.2 - this.camPitch) * (1 - Math.exp(-dt * 1.5));
-      }
-    } else {
-      const rx = -Math.cos(this.camYaw), rz = Math.sin(this.camYaw);
-      tx = this.px + rx * 0.5;
-      ty = this.py + 1.6;
-      tz = this.pz + rz * 0.5;
-      dist = 3.6 + (sprint ? 0.5 : 0);
-    }
-    if (!this.camInit) {
-      this.camT.set(tx, ty, tz);
-      this.camInit = true;
-    } else {
-      const k = 1 - Math.exp(-dt * (this.inCar ? 14 : 20));
-      this.camT.x += (tx - this.camT.x) * k;
-      this.camT.y += (ty - this.camT.y) * k;
-      this.camT.z += (tz - this.camT.z) * k;
-    }
-    const cp = Math.cos(this.camPitch);
-    const ox = -Math.sin(this.camYaw) * cp, oy = Math.sin(this.camPitch), oz = -Math.cos(this.camYaw) * cp;
-    // camera collision
-    let d = dist;
-    for (let s = 0.6; s <= dist; s += 0.45) {
-      if (this.city.blockedAt(this.camT.x + ox * s, this.camT.y + oy * s, this.camT.z + oz * s)) {
-        d = Math.max(1.0, s - 0.55);
-        break;
-      }
-    }
-    cam.position.set(this.camT.x + ox * d, this.camT.y + oy * d, this.camT.z + oz * d);
-    if (this.shake > 0.001) {
-      cam.position.x += (Math.random() - 0.5) * this.shake * 0.5;
-      cam.position.y += (Math.random() - 0.5) * this.shake * 0.5;
-      this.shake *= Math.exp(-dt * 7);
-    }
-    cam.lookAt(this.camT.x, this.camT.y + (this.inCar ? 0.5 : 0.05), this.camT.z);
-
-    const speedFov = this.inCar ? Math.min(14, Math.abs(this.car.speed) * 0.28) + (this.car.boosting ? 9 : 0) : sprint && Math.hypot(this.pvx, this.pvz) > 6 ? 5 : 0;
-    const tf = 62 + speedFov;
-    this.fov += (tf - this.fov) * (1 - Math.exp(-dt * 4));
-    if (Math.abs(cam.fov - this.fov) > 0.02) {
-      cam.fov = this.fov;
-      cam.updateProjectionMatrix();
-    }
-    this.boostU.value += ((this.inCar && this.car.boosting ? 1 : 0) - this.boostU.value) * (1 - Math.exp(-dt * 5));
+  // =================================================================== persistence
+  saveGame() {
+    try {
+      const inv: Record<string, { have: boolean; mag: number; reserve: number }> = this.inv;
+      localStorage.setItem('neon-nagri-v2', JSON.stringify({ cash: this.player.cash, inv, mission: this.missionIndex, done: [...this.completed], hour: this.sky.hour, owned: this.ownedCars, kills: hud.stats.kills }));
+    } catch { /* ignore */ }
+  }
+  loadGame() {
+    try {
+      const raw = localStorage.getItem('neon-nagri-v2');
+      if (!raw) return;
+      const s = JSON.parse(raw);
+      this.player.cash = s.cash ?? this.player.cash;
+      for (const k of Object.keys(s.inv ?? {})) if (this.inv[k]) this.inv[k] = s.inv[k];
+      this.missionIndex = Math.min(s.mission ?? 0, MISSIONS.length);
+      this.completed = new Set(s.done ?? []);
+      this.sky.hour = s.hour ?? this.sky.hour;
+      this.ownedCars = s.owned ?? [];
+    } catch { /* ignore */ }
+  }
+  resetSave() {
+    try { localStorage.removeItem('neon-nagri-v2'); } catch { /* ignore */ }
+    location.reload();
   }
 
-  private updateMarkers() {
-    for (let i = 0; i < this.markerObjs.length; i++) {
-      const m = this.markers[i];
-      if (m) this.markerObjs[i].set(m.x, m.z, m.r ?? 4, m.color ?? '#ffd23a', i === 0 ? 1 : 0.55);
-      else this.markerObjs[i].hide();
+  // =================================================================== HUD + map
+  private updateHud(dt: number) {
+    this.hudT -= dt;
+    this.mapT -= dt;
+    hud.hitMarker = Math.max(0, hud.hitMarker - dt * 4);
+    hud.damage = Math.max(0, hud.damage - dt * 1.4);
+    if (this.hudT > 0 && this.state !== 'menu') {
+      // still draw the minimap smoothly
     }
+    if (this.mapT <= 0) { this.mapT = 1 / 24; this.drawMiniMap(); if (hud.fullMap) this.drawBigMap(); }
+    if (this.hudT > 0) return;
+    this.hudT = 0.08;
+    const p = this.player, v = p.vehicle;
+    hud.hp = Math.round(p.hp); hud.armor = Math.round(p.armor); hud.cash = p.cash; hud.wanted = this.wanted;
+    hud.inCar = !!v;
+    if (v) { hud.speed = Math.round(Math.abs(v.speed) * 3.6); hud.gear = this.audio.gear; hud.carHealth = v.health / v.maxHealth; hud.nitro = v.nitro; hud.boosting = v.boosting; hud.carName = v.spec.name; }
+    hud.clock = this.sky.clock;
+    hud.weather = this.sky.rainTarget > 0.2 ? 'rain' : 'clear';
+    hud.arrest = this.police.arrestProgress / 1.6;
+    hud.timer = this.missionTimer ? { t: this.missionTimer.t, label: this.missionTimer.label } : null;
+    if (this.markers.length && hud.objective) hud.objDist = Math.round(this.distTo(this.markers[0].x, this.markers[0].z));
+    else hud.objDist = null;
+    this.updateWeaponHud();
+    emitHud();
   }
 
-  // ------------------------------------------------------------------ minimap
-  private drawMinimap() {
-    const cv = this.mini;
-    const ctx = cv.getContext('2d');
-    if (!ctx || !this.mapCanvas) return;
-    const S = cv.width, half = S / 2;
-    const scale = half / 135;
-    const yaw = this.camYaw;
-    const fx = Math.sin(yaw), fz = Math.cos(yaw);
-    ctx.clearRect(0, 0, S, S);
+  private buildMap() {
+    const c = document.createElement('canvas');
+    c.width = c.height = 1240;
+    const g = c.getContext('2d')!;
+    const s = c.width / MAPW;
+    const X = (x: number) => (x + MAPW / 2) * s;
+    g.fillStyle = '#1f2e22';
+    g.fillRect(0, 0, c.width, c.height);
+    g.fillStyle = '#17405a';
+    g.fillRect(X(HALF + 62), 0, c.width, c.height);
+    g.fillStyle = '#c9b88a';
+    g.fillRect(X(HALF + 8), 0, (54) * s, c.height);
+    const N = this.world.zones.length;
+    void N;
+    // roads
+    g.fillStyle = '#383c44';
+    for (let k = 0; k <= 8; k++) {
+      const pos = (k - 4) * 120;
+      g.fillRect(X(pos - 8), X(-HALF - 8), 16 * s, (HALF * 2 + 16) * s);
+      g.fillRect(X(-HALF - 8), X(pos - 8), (HALF * 2 + 16) * s, 16 * s);
+    }
+    g.strokeStyle = '#d8b24a'; g.lineWidth = 1;
+    for (let k = 0; k <= 8; k++) {
+      const pos = (k - 4) * 120;
+      g.beginPath(); g.moveTo(X(pos), X(-HALF)); g.lineTo(X(pos), X(HALF)); g.stroke();
+      g.beginPath(); g.moveTo(X(-HALF), X(pos)); g.lineTo(X(HALF), X(pos)); g.stroke();
+    }
+    // blocks
+    for (let i = 0; i < 8; i++) for (let j = 0; j < 8; j++) {
+      const cx = (i - 3.5) * 120, cz = (j - 3.5) * 120;
+      const zone = this.world.zones[i][j];
+      g.fillStyle = zone === 'park' ? '#2d5a34' : zone === 'beach' ? '#bba878' : '#565b63';
+      g.fillRect(X(cx - 52), X(cz - 52), 104 * s, 104 * s);
+    }
+    for (const b of this.world.boxes) {
+      g.fillStyle = b.h > 50 ? '#8a909c' : b.h > 14 ? '#737a86' : '#656b76';
+      g.fillRect(X(b.x0), X(b.z0), (b.x1 - b.x0) * s, (b.z1 - b.z0) * s);
+    }
+    this.mapCanvas = c;
+  }
+
+  private drawMapInto(ctx: CanvasRenderingContext2D, w: number, h: number, cx: number, cz: number, zoom: number, rot: number | null, big: boolean) {
     ctx.save();
-    ctx.beginPath();
-    ctx.arc(half, half, half - 3, 0, Math.PI * 2);
-    ctx.clip();
-    ctx.fillStyle = '#0b1016';
-    ctx.fillRect(0, 0, S, S);
-    ctx.save();
-    ctx.translate(half, half);
-    ctx.transform(-fz * scale, -fx * scale, fx * scale, -fz * scale, 0, 0);
-    ctx.translate(-this.px, -this.pz);
-    ctx.drawImage(this.mapCanvas, -380, -380);
-    ctx.restore();
-
-    const toScreen = (x: number, z: number) => {
-      const dx = x - this.px, dz = z - this.pz;
-      let sx = (-fz * dx + fx * dz) * scale, sy = (-fx * dx - fz * dz) * scale;
-      const d = Math.hypot(sx, sy);
-      const lim = half - 16;
-      let edge = false;
-      if (d > lim) {
-        sx = (sx / d) * lim;
-        sy = (sy / d) * lim;
-        edge = true;
-      }
-      return { x: half + sx, y: half + sy, edge };
-    };
-    if (this.state === 'playing') {
-      this.markers.forEach((m, i) => {
-        const p = toScreen(m.x, m.z);
-        ctx.fillStyle = m.color ?? '#ffd23a';
-        ctx.strokeStyle = '#000';
-        ctx.lineWidth = 3;
-        ctx.beginPath();
-        ctx.arc(p.x, p.y, (i === 0 ? 11 : 7) * (S / 400), 0, Math.PI * 2);
-        ctx.stroke();
-        ctx.fill();
-      });
-      if (this.target) {
-        const p = toScreen(this.target.x, this.target.z);
-        ctx.fillStyle = '#ff3b3b';
-        ctx.strokeStyle = '#fff';
-        ctx.lineWidth = 2;
-        ctx.beginPath();
-        ctx.arc(p.x, p.y, 8 * (S / 400), 0, Math.PI * 2);
-        ctx.fill();
-        ctx.stroke();
-      }
-      if (this.carVisible && !this.inCar) {
-        const p = toScreen(this.car.x, this.car.z);
-        ctx.fillStyle = '#38d6ff';
-        ctx.fillRect(p.x - 6, p.y - 6, 12, 12);
-      }
-      // player arrow
-      const heading = this.inCar ? this.car.heading : this.pheading;
-      ctx.save();
-      ctx.translate(half, half);
-      ctx.rotate(yaw - heading);
-      ctx.fillStyle = '#ffffff';
-      ctx.strokeStyle = '#000';
-      ctx.lineWidth = 3;
-      const u = S / 400;
+    ctx.clearRect(0, 0, w, h);
+    ctx.translate(w / 2, h / 2);
+    if (rot !== null) ctx.rotate(rot - Math.PI);
+    ctx.scale(zoom, zoom);
+    ctx.translate(-cx, -cz);
+    ctx.imageSmoothingEnabled = true;
+    ctx.drawImage(this.mapCanvas, -MAPW / 2, -MAPW / 2, MAPW, MAPW);
+    const inv = 1 / zoom;
+    // GPS
+    if (this.routePts.length > 1) {
+      ctx.strokeStyle = '#38d6ff'; ctx.lineWidth = 4 * inv * (big ? 1.4 : 1); ctx.lineJoin = 'round';
       ctx.beginPath();
-      ctx.moveTo(0, -15 * u);
-      ctx.lineTo(10 * u, 12 * u);
-      ctx.lineTo(0, 6 * u);
-      ctx.lineTo(-10 * u, 12 * u);
-      ctx.closePath();
+      ctx.moveTo(this.routePts[0].x, this.routePts[0].z);
+      for (const q of this.routePts) ctx.lineTo(q.x, q.z);
       ctx.stroke();
-      ctx.fill();
-      ctx.restore();
     }
+    const dot = (x: number, z: number, r: number, col: string, ring = false) => {
+      ctx.fillStyle = col; ctx.strokeStyle = '#000'; ctx.lineWidth = 1.5 * inv;
+      ctx.beginPath(); ctx.arc(x, z, r * inv, 0, 7); ctx.fill();
+      if (ring) ctx.stroke();
+    };
+    for (const poi of this.world.pois) {
+      if (poi.r < 2) continue;
+      dot(poi.x, poi.z, big ? 7 : 5, poi.kind === 'shop' ? '#ffb02a' : poi.kind === 'story' ? '#ff4fd8' : poi.kind === 'home' ? '#4ad0ff' : poi.kind === 'mission' ? '#6aff9a' : '#c8d0e0', true);
+    }
+    for (const m of this.markers) dot(m.x, m.z, big ? 9 : 7, m.color ?? '#ffd23a', true);
+    for (const v of this.vehicles) {
+      if (v.sirenOn && !v.wrecked) { const f = Math.floor(this.time * 4) % 2; dot(v.x, v.z, 5, f ? '#ff3030' : '#3060ff', true); }
+    }
+    for (const n of this.crowd.list) {
+      if (!n.alive) continue;
+      if (n.role === 'gang' && n.hostile) dot(n.x, n.z, 4, '#ff3030');
+      else if ((n.role === 'cop' || n.role === 'swat') && this.wanted > 0) dot(n.x, n.z, 4, '#4a7aff');
+    }
+    if (this.police.heli.active) dot(this.police.heli.x, this.police.heli.z, 6, '#ffffff', true);
     ctx.restore();
-    ctx.strokeStyle = 'rgba(255,255,255,0.85)';
-    ctx.lineWidth = 4;
-    ctx.beginPath();
-    ctx.arc(half, half, half - 3, 0, Math.PI * 2);
-    ctx.stroke();
+    // player arrow
+    ctx.save();
+    ctx.translate(w / 2, h / 2);
+    if (rot === null) { const ppx = (this.player.x - cx) * zoom, ppz = (this.player.z - cz) * zoom; ctx.translate(ppx, ppz); ctx.rotate(Math.PI - this.player.heading + Math.PI); }
+    ctx.fillStyle = '#ffffff'; ctx.strokeStyle = '#000'; ctx.lineWidth = 2;
+    ctx.beginPath(); ctx.moveTo(0, -9); ctx.lineTo(6.5, 7); ctx.lineTo(0, 3.5); ctx.lineTo(-6.5, 7); ctx.closePath(); ctx.fill(); ctx.stroke();
+    ctx.restore();
   }
 
-  // ------------------------------------------------------------------ hud
-  private emit(force: boolean) {
-    const now = performance.now();
-    if (!force && now - this.lastEmit < 100) return;
-    this.lastEmit = now;
-    const h = this.hud;
-    h.inCar = this.inCar;
-    h.speed = this.inCar ? Math.round(Math.abs(this.car.speed) * 3.6) : 0;
-    h.nitro = this.car ? this.car.nitro : 1;
-    h.objective = this.objective;
-    h.cash = this.cash;
-    h.timer = this.timer ? Math.max(0, this.timer.t) : null;
-    h.timerLabel = this.timer?.label ?? '';
-    h.lost = this.lost;
-    h.cp = this.cp;
-    h.fps = this.fps;
-    h.res = Math.round(this.res * 100) / 100;
-    const m = this.markers[0];
-    h.distance = m && this.state === 'playing' ? Math.round(this.distTo(m.x, m.z)) : null;
-    let prompt: string | null = null;
-    if (this.state === 'playing') {
-      if (this.inCar) prompt = Math.abs(this.car.speed) < 9 ? 'F — Gaadi se utro' : null;
-      else if (this.carVisible && Math.hypot(this.car.x - this.px, this.car.z - this.pz) < 4.8) prompt = 'F — Gaadi me baitho';
+  private drawMiniMap() {
+    const c = this.miniCanvas;
+    if (!c || hud.phase === 'menu' || hud.phase === 'loading') return;
+    const ctx = c.getContext('2d');
+    if (!ctx) return;
+    const p = this.player;
+    const x = p.vehicle ? p.vehicle.x : p.x, z = p.vehicle ? p.vehicle.z : p.z;
+    this.routeT -= 1 / 24;
+    if (this.routeT <= 0) {
+      this.routeT = 1;
+      const m = this.markers.find((q) => q.gps !== false);
+      if (m && hud.objective) {
+        const r = this.world.route(x, z, m.x, m.z).map((n) => nodePos(n.i, n.j));
+        this.routePts = [{ x, z }, ...r, { x: m.x, z: m.z }];
+        // trim detour to first node when player is on the same road segment
+      } else this.routePts = [];
     }
-    h.prompt = prompt;
-    this.cb.onHud({ ...h });
+    if (this.routePts.length) this.routePts[0] = { x, z };
+    const zoom = this.player.vehicle ? 0.9 + clamp(Math.abs(this.player.vehicle.speed) / 90, 0, 0.6) * -0.4 : 1.25;
+    this.drawMapInto(ctx, c.width, c.height, x, z, zoom, this.camYaw, false);
   }
+  private drawBigMap() {
+    const c = this.bigCanvas;
+    if (!c) return;
+    const ctx = c.getContext('2d');
+    if (!ctx) return;
+    const zoom = Math.min(c.width, c.height) / 1100;
+    this.drawMapInto(ctx, c.width, c.height, 20, 0, zoom, null, true);
+  }
+
+  // ---------------------------------------------------------------- debug hooks (used by automated checks)
+  debug = {
+    teleport: (x: number, z: number) => this.teleportPlayer(x, z, 0),
+    wanted: (n: number) => this.setWanted(n),
+    car: () => { const v = this.lastCar!; this.enterVehicle(v); },
+    time: (h: number) => { this.sky.hour = h; },
+    rain: (v: number) => { this.sky.setRain(v); },
+    god: () => { this.flags.god = true; },
+    start: () => this.startGame(),
+    cam: (yaw: number, pitch: number) => { this.camYaw = yaw; this.camPitch = pitch; },
+    giveAll: () => { for (const w of WEAPON_ORDER) this.giveWeapon(w, 200); },
+    mission: (i: number) => { this.missionIndex = i; },
+    spawnCops: () => { this.setWanted(3); },
+    npc: (look: string, x: number, z: number) => this.spawnNpc(LOOKS[look], 'story', x, z, Math.PI),
+    carAt: (k: CarKind, x: number, z: number, h: number, c = 0xcc2222) => this.spawnCar(k, c, x, z, h, 'parked'),
+    ang: (a: number) => angDiff(0, a),
+  };
 }
-
-const tick = () => new Promise<void>((r) => setTimeout(r, 30));
-

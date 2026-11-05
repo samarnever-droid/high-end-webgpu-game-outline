@@ -1,0 +1,55 @@
+import { useSyncExternalStore } from 'react';
+
+export interface Choice { id: number; label: string }
+export interface ShopItem { id: string; label: string; desc: string; price: number; disabled?: boolean; tag?: string }
+export interface Toast { id: number; title: string; text: string; kind: 'info' | 'good' | 'bad' | 'mission' | 'cash'; t: number }
+
+export interface HudState {
+  phase: 'loading' | 'menu' | 'playing' | 'paused';
+  loadMsg: string; loadPct: number;
+  hp: number; armor: number; cash: number; wanted: number; evading: boolean; arrest: number;
+  weapon: { id: string; name: string; icon: string; mag: number; reserve: number; cls: string; reloading: boolean; infinite: boolean };
+  speed: number; gear: number; inCar: boolean; carName: string; carHealth: number; nitro: number; boosting: boolean;
+  objective: string | null; objDist: number | null; missionTitle: string | null; timer: { t: number; label: string } | null; lost: number | null;
+  subtitle: { who: string; text: string } | null;
+  dialogue: { who: string; text: string; choices: Choice[] | null; role: string; id: number } | null;
+  prompt: string | null;
+  toasts: Toast[];
+  clock: string; radio: string; weather: 'clear' | 'rain';
+  fullMap: boolean; phone: boolean; shop: { id: string; title: string; sub: string; items: ShopItem[] } | null;
+  overlay: null | 'wasted' | 'busted' | 'passed' | 'failed' | 'ending'; overlayText: string;
+  fade: boolean; cinematic: boolean; aiming: boolean; hitMarker: number; damage: number; locked: boolean;
+  settings: { volume: number; music: number; shadows: boolean; bloom: boolean; sens: number; timeScale: number; quality: 'low' | 'high' };
+  missions: { id: number; title: string; done: boolean; active: boolean }[];
+  hint: string | null;
+  fps: number;
+  stats: { kills: number; distance: number; missions: number };
+}
+
+export const hud: HudState = {
+  phase: 'loading', loadMsg: 'Booting engine…', loadPct: 0,
+  hp: 100, armor: 0, cash: 0, wanted: 0, evading: false, arrest: 0,
+  weapon: { id: 'fists', name: 'Fists', icon: '✊', mag: 0, reserve: 0, cls: 'none', reloading: false, infinite: true },
+  speed: 0, gear: 1, inCar: false, carName: '', carHealth: 1, nitro: 1, boosting: false,
+  objective: null, objDist: null, missionTitle: null, timer: null, lost: null,
+  subtitle: null, dialogue: null, prompt: null, toasts: [],
+  clock: '12:00', radio: 'Radio Off', weather: 'clear',
+  fullMap: false, phone: false, shop: null,
+  overlay: null, overlayText: '', fade: false, cinematic: false, aiming: false, hitMarker: 0, damage: 0, locked: false,
+  settings: { volume: 0.7, music: 0.6, shadows: true, bloom: true, sens: 1, timeScale: 1, quality: 'high' },
+  missions: [], hint: null, fps: 60,
+  stats: { kills: 0, distance: 0, missions: 0 },
+};
+
+let snapshot: HudState = { ...hud };
+const subs = new Set<() => void>();
+export function emitHud() {
+  snapshot = { ...hud };
+  subs.forEach((f) => f());
+}
+export function useHud(): HudState {
+  return useSyncExternalStore(
+    (f) => { subs.add(f); return () => subs.delete(f); },
+    () => snapshot
+  );
+}
