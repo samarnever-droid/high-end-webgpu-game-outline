@@ -157,8 +157,10 @@ export function Hud({ game }: { game: Game }) {
 
       {/* prompt */}
       {h.prompt && !h.dialogue && !h.shop && (
-        <div className="absolute bottom-[26%] left-1/2 -translate-x-1/2 rounded-md bg-black/70 px-4 py-2 text-base backdrop-blur-sm">
-          <span className="mr-2 rounded bg-white px-2 py-0.5 text-black">E</span>{h.prompt}
+        <div key={h.prompt} className="absolute bottom-[26%] left-1/2 -translate-x-1/2" style={{ animation: 'promptIn .28s cubic-bezier(.2,1.7,.4,1)' }}>
+          <div className="rounded-md bg-black/70 px-4 py-2 text-base backdrop-blur-sm" style={{ boxShadow: '0 0 0 1px rgba(255,255,255,.12), 0 8px 24px rgba(0,0,0,.45)' }}>
+            <span className="mr-2 inline-block rounded bg-white px-2 py-0.5 text-black" style={{ animation: 'keyPulse 1.2s ease-in-out infinite' }}>E</span>{h.prompt}
+          </div>
         </div>
       )}
 
@@ -175,7 +177,7 @@ export function Hud({ game }: { game: Game }) {
       {/* toasts */}
       <div className="absolute right-6 top-40 flex w-72 flex-col items-end gap-2">
         {h.toasts.map((t) => (
-          <div key={t.id} className={`rounded-md border-l-4 bg-black/65 px-3 py-2 text-right backdrop-blur-sm ${t.kind === 'bad' ? 'border-red-500' : t.kind === 'good' ? 'border-emerald-400' : t.kind === 'cash' ? 'border-emerald-300' : t.kind === 'mission' ? 'border-fuchsia-400' : 'border-cyan-400'}`}>
+          <div key={t.id} style={{ animation: 'toastIn .38s cubic-bezier(.2,1.4,.4,1)' }} className={`rounded-md border-l-4 bg-black/65 px-3 py-2 text-right backdrop-blur-sm ${t.kind === 'bad' ? 'border-red-500' : t.kind === 'good' ? 'border-emerald-400' : t.kind === 'cash' ? 'border-emerald-300' : t.kind === 'mission' ? 'border-fuchsia-400' : 'border-cyan-400'}`}>
             <div className={`text-sm ${t.kind === 'cash' ? 'text-emerald-300' : ''}`}>{t.title}</div>
             {t.text && <div className="text-[11px] text-white/70" style={{ fontFamily: 'system-ui' }}>{t.text}</div>}
           </div>

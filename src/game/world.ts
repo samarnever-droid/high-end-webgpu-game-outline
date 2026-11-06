@@ -5,6 +5,8 @@ import {
 } from './textures';
 import { mulberry32, pick, range, type RNG } from './util';
 import { patchWet } from './wet';
+import { dressBuilding } from './arch';
+import { buildStreetDressing } from './street';
 import { createWater, updateWater } from './water';
 import { frondTexture, makeCrownGeometry, makeGlow, makeMountainGeometry, makePalmGeometries, makeTankGeometry, makeTrunkGeometry, patchFoliage, windUniform } from './props';
 import type { Sky } from './sky';
@@ -125,6 +127,7 @@ export class World {
     this.buildRoads();
     this.buildBlocks();
     this.buildProps();
+    buildStreetDressing(this);
     this.buildSea();
     this.buildSurroundings();
     this.buildRamps();
@@ -384,6 +387,8 @@ export class World {
               }
             }
           }
+          // real depth: slabs, sills, fins, fire escapes, porches, crowns
+          dressBuilding(pl, { x0, z0, w, d, floors, kind, gable, special: !!sp2 }, this.detailRng);
           // colliders
           this.addBox(x0, x0 + w, z0, z0 + d, hh);
           return { bx, bz, hh };

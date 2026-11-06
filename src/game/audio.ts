@@ -224,6 +224,16 @@ export class AudioEngine {
   cash() { this.tone(880, 880, 0.08, 0.2, 'triangle'); this.tone(1320, 1320, 0.2, 0.2, 'triangle', 0.07); }
   click() { this.tone(700, 500, 0.04, 0.15, 'square'); }
   door() { this.noise(0.12, 0.4, 'lowpass', 600, 150, 1, 0, 0.1); this.tone(100, 60, 0.08, 0.3); }
+  // ---- micro-interaction cues
+  chime() { this.tone(988, 988, 0.22, 0.14, 'sine'); this.tone(740, 740, 0.35, 0.14, 'sine', 0.14); }
+  ding() { this.tone(2093, 2093, 0.7, 0.2, 'sine'); this.tone(3136, 3136, 0.45, 0.08, 'sine', 0.01); }
+  switchClick(on: boolean) { this.noise(0.03, 0.5, 'highpass', 3500, 2500, 2, 0, 0); this.tone(on ? 1200 : 800, on ? 1500 : 500, 0.05, 0.1, 'square', 0.02); }
+  rattle() { for (let i = 0; i < 6; i++) this.noise(0.05, 0.35, 'bandpass', 3000 + Math.random() * 1500, 2000, 4, i * 0.06, 0.1); }
+  splash(k = 1) { this.noise(0.09, 0.22 * k, 'bandpass', 2600 + Math.random() * 800, 1200, 1.4, 0, 0.1); }
+  fridge() { this.noise(0.35, 0.25, 'lowpass', 400, 120, 1, 0, 0.1); this.tone(1700, 1100, 0.12, 0.1, 'sine', 0.38); this.noise(0.12, 0.3, 'bandpass', 5000, 3000, 3, 0.55, 0.05); }
+  tvOn() { this.noise(0.35, 0.22, 'highpass', 2000, 6000, 0.7, 0, 0.1); this.tone(15000, 15000, 0.15, 0.03, 'sine'); }
+  thud(k = 1) { this.noise(0.12, 0.45 * k, 'lowpass', 500, 90, 1, 0, 0.1); this.tone(90, 45, 0.12, 0.3 * k, 'sine'); }
+  pickup() { this.tone(660, 880, 0.08, 0.14, 'triangle'); this.tone(990, 1320, 0.1, 0.12, 'triangle', 0.07); }
   wanted() { this.tone(440, 440, 0.12, 0.2, 'square'); this.tone(554, 554, 0.12, 0.2, 'square', 0.13); this.tone(659, 659, 0.2, 0.2, 'square', 0.26); }
   complete() { [523, 659, 784, 1047].forEach((f, i) => this.tone(f, f, 0.35, 0.22, 'triangle', i * 0.12)); }
   fail() { [392, 330, 262, 196].forEach((f, i) => this.tone(f, f * 0.98, 0.4, 0.22, 'sawtooth', i * 0.15)); }

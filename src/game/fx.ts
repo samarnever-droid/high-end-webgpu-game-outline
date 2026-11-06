@@ -178,6 +178,15 @@ export class FX {
   dust(x: number, y: number, z: number, vx: number, vz: number, amt = 1, tint: [number, number, number] = [0.7, 0.68, 0.62]) {
     for (let i = 0; i < amt; i++) this.smoke.emit(x + (Math.random() - 0.5) * 0.5, y + 0.1, z + (Math.random() - 0.5) * 0.5, vx * 0.2 + (Math.random() - 0.5), 0.5 + Math.random(), vz * 0.2 + (Math.random() - 0.5), 1 + Math.random() * 0.8, 0.6, 2.8, tint[0], tint[1], tint[2], 0.35, -0.1, 0.97);
   }
+  /** puddle splash when walking in the rain: a crown of droplets + a soft ring of mist */
+  splash(x: number, y: number, z: number, k = 1) {
+    const n = 5 + Math.floor(k * 6);
+    for (let i = 0; i < n; i++) {
+      const a = Math.random() * 6.283, sp = 0.5 + Math.random() * 1.1;
+      this.smoke.emit(x + Math.cos(a) * 0.08, y + 0.04, z + Math.sin(a) * 0.08, Math.cos(a) * sp, 1.6 + Math.random() * 1.6, Math.sin(a) * sp, 0.4 + Math.random() * 0.25, 0.1, 0.22, 0.78, 0.84, 0.92, 0.5, 9, 0.96);
+    }
+    this.smoke.emit(x, y + 0.03, z, 0, 0.15, 0, 0.55, 0.2, 1.1, 0.8, 0.86, 0.92, 0.18, 0, 0.95);
+  }
   tyreSmoke(x: number, y: number, z: number, vx: number, vz: number) {
     this.smoke.emit(x, y + 0.15, z, vx * 0.1 + (Math.random() - 0.5) * 0.6, 0.6 + Math.random() * 0.5, vz * 0.1 + (Math.random() - 0.5) * 0.6, 1.1 + Math.random() * 0.5, 0.5, 2.4, 0.85, 0.85, 0.88, 0.28, -0.15, 0.97);
   }

@@ -164,7 +164,7 @@ void main(){
     }
 
     // ---------------------------------------------------------------- wet ground reflections
-    if (uSSR > 0.5 && uWet > 0.02) {
+    if (uSSR > 0.5 && uWet > 0.02 && uIndoor < 0.5) {
       vec3 Nv = viewNormal(vUv, px, P);
       vec3 Nw = normalize((uCamWorld * vec4(Nv, 0.0)).xyz);
       vec3 wp = uCamPos + rdW * dist;

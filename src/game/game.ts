@@ -181,7 +181,9 @@ export class Game {
     await tick();
     this.playerHuman = new Human(LOOKS.veer);
     this.playerHuman.root.rotation.order = 'YXZ';
-    this.playerHuman.onStep = (s) => { if (!this.player.vehicle && this.state === 'play') this.audio.step(this.world.onRoad(this.player.x, this.player.z) ? 'asphalt' : 'pave', Math.hypot(this.player.vx, this.player.vz)); void s; };
+    this.playerHuman.onStep = (s) => { if (!this.player.vehicle && this.state === 'play') this.audio.step(this.world.onRoad(this.player.x, this.player.z) ? 'asphalt' : 'pave', Math.hypot(this.player.vx, this.player.vz));
+      if (this.wetness > 0.3 && !this.interiors.current && !this.player.vehicle) { this.fx.splash(this.player.x, this.player.y, this.player.z, this.wetness); this.audio.splash(this.wetness); }
+      void s; };
     this.scene.add(this.playerHuman.root);
 
     this.crowd = new Crowd(this);
@@ -503,8 +505,10 @@ export class Game {
     u.raysAmount = clamp(sunUp * 2.2, 0, 1) * (1 - sk.rain * 0.85) * dayK * (sk.sunDir.y < 0.25 ? 1.35 : 1);
     u.flareAmount = clamp(sunUp * 3, 0, 1) * (1 - sk.rain) * dayK;
     this.wetness += (Math.min(1, sk.rain * 1.6) - this.wetness) * (1 - Math.exp(-dt * (sk.rain > this.wetness ? 0.5 : 0.03)));
-    wetUniform.value = this.wetness;
-    u.wet = this.wetness;
+    // interiors are always bone dry: no puddles, no wet reflections, no rain
+    const dryK = 1 - sk.indoor;
+    wetUniform.value = this.wetness * dryK;
+    u.wet = this.wetness * dryK;
     u.indoor = sk.indoor;
     u.time = this.time;
     sk.autoWeather = st.autoWeather && this.state === 'play';
@@ -663,8 +667,16 @@ export class Game {
     if (!p.onGround || p.y > gy + 0.05) {
       p.vy -= 17 * dt;
       p.y += p.vy * dt;
-      if (p.y <= gy) { p.y = gy; p.vy = 0; p.onGround = true; }
-      else p.onGround = false;
+      if (p.y <= gy) {
+        const impact = -p.vy;
+        p.y = gy; p.vy = 0; p.onGround = true;
+        if (impact > 5) {
+          // hard landing: camera dip, dust, thud (and a splash in the wet)
+          this.camShake += Math.min(0.5, (impact - 4) * 0.07);
+          this.audio.thud(Math.min(1, impact / 11));
+          if (!inside) { this.fx.dust(p.x, p.y + 0.05, p.z, 0, 0, 3); if (this.wetness > 0.3) this.fx.splash(p.x, p.y, p.z, 1); }
+        }
+      } else p.onGround = false;
     } else {
       p.y = damp(p.y, gy, 18, dt);
     }
@@ -764,7 +776,8 @@ export class Game {
     if (this.interiors.current) {
       const ia = this.interiors.interactAt(p.x, p.z);
       hud.prompt = ia ? ia.prompt : null;
-      this.interact = ia ? { kind: 'poi', poi: ia.kind === 'exit' ? '__exit' : this.interiors.current.id } : { kind: 'none' };
+      this.interact = ia ? { kind: 'poi', poi: ia.kind === 'exit' ? '__exit' : ia.kind === 'prop' ? '__prop' : this.interiors.current.id } : { kind: 'none' };
+      if (ia?.prop) this.interiors.activeProp = ia.prop;
       return;
     }
     if (!p.vehicle) {
@@ -814,6 +827,7 @@ export class Game {
     if (it.kind === 'npc' && it.npc) this.story?.talk(it.npc.key);
     else if (it.kind === 'poi' && it.poi) {
       if (it.poi === '__exit') this.interiors.exit();
+      else if (it.poi === '__prop') this.interiors.useProp();
       else if (this.interiors.current) this.openPoi(it.poi);
       else if (this.player.vehicle || !this.interiors.supports(it.poi)) this.openPoi(it.poi);
       else this.interiors.enter(it.poi);
@@ -1764,7 +1778,7 @@ export class Game {
     for (const c of this.vehicles) if (c.sirenOn && !c.wrecked) near = Math.min(near, Math.hypot(c.x - this.player.x, c.z - this.player.z));
     a.sirenOn(near < 200, clamp(1 - near / 200, 0, 1));
     if (this.police.heli.active && Math.random() < dt * 8) a.heli();
-    a.ambience(this.sky.rain, this.sky.night, this.world.onRoad(this.player.x, this.player.z) ? 1 : 0.4);
+    a.ambience(this.sky.rain * (1 - 0.82 * this.sky.indoor), this.sky.night, this.world.onRoad(this.player.x, this.player.z) ? 1 : 0.4);
     if (this.mapT === 0) void 0;
   }
 

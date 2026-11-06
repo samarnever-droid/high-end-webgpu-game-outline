@@ -363,7 +363,13 @@ export class Crowd {
   private rng = mulberry32(777);
   private t = 0;
   constructor(private g: Game) {
-    for (let i = 0; i < 12; i++) this.looks.push(randomLook(this.rng, i % 2 === 0));
+    void this.rng;
+  }
+  /** 40 distinct citizens, each built lazily the first time it's drawn (keeps load time and memory sane) */
+  private pool: (Look | null)[] = new Array(40).fill(null);
+  pickLook(): Look {
+    const i = Math.floor(Math.random() * this.pool.length);
+    return (this.pool[i] ??= randomLook(mulberry32(4100 + i * 131), i % 11 < 5));
   }
   spawnOne() {
     const g = this.g;
@@ -373,7 +379,7 @@ export class Crowd {
     if (bi < 0 || bj < 0 || bi >= N - 1 || bj >= N) return;
     const zone = g.world.zones[bi][bj];
     if (zone === 'industrial') return;
-    const npc = new Npc(pick(this.looks), 'ped');
+    const npc = new Npc(this.pickLook(), 'ped');
     const c = blockCenter(bi, bj);
     npc.place(c.x, c.z, 0);
     npc.loop.bi = bi; npc.loop.bj = bj; npc.loop.s = Math.random() * SIDE * 4; npc.loop.dir = Math.random() < 0.5 ? 1 : -1; npc.loop.off = (Math.random() - 0.5) * 2.4;

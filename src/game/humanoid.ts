@@ -38,6 +38,7 @@ export interface Look {
   under?: number;
   bottom: { type: BottomType; color: number; kind?: FabricKind };
   shoes: { color: number; sole?: number; boot?: boolean };
+  faceW?: number; noseK?: number; earK?: number; neckK?: number; eyeK?: number; // random facial proportions
   extras?: ('watch' | 'chain' | 'badge' | 'helmet' | 'belt' | 'tie' | 'bandana' | 'earpiece' | 'vestarmor' | 'cap' | 'gloves' | 'mask')[];
   capColor?: number;
 }
@@ -100,22 +101,41 @@ const HAIRS = [0x0e0a08, 0x1c140f, 0x2b1b12, 0x3b281a, 0x5a3a22, 0x8a6a3e, 0xb5a
 const EYES = [0x241408, 0x3a2314, 0x4e3a20, 0x2c4a60, 0x3f5a38];
 const TOP_COLS = [0x2e3b4e, 0x7a2020, 0x2f5d3a, 0xd8d4c8, 0x15161a, 0xb48a2a, 0x4a4f8a, 0x8a4a2a, 0xd0a0a0, 0x3f7a8a, 0xe0e0e0, 0x55555a];
 const BOT_COLS = [0x232b3c, 0x2c3a52, 0x151618, 0x4a4234, 0x5a5a5c, 0x1a2a3a, 0x3a3228];
+const DYED = [0x7a2a8a, 0x2a5aa0, 0xb02a3a, 0x2f8a6a, 0xd06a9a];
 export function randomLook(rng: RNG, female?: boolean): Look {
   const f = female ?? rng() < 0.46;
-  const tops: TopType[] = f ? ['tee', 'tank', 'jacket', 'hoodie', 'shirt'] : ['tee', 'jacket', 'hoodie', 'shirt', 'tee', 'vest'];
-  const hs: HairStyle[] = f ? ['long', 'ponytail', 'bob', 'short', 'long'] : ['short', 'buzz', 'quiff', 'bald', 'short', 'slick', 'cap', 'beanie'];
-  const bt: BottomType[] = f ? ['jeans', 'skirt', 'track', 'shorts', 'jeans'] : ['jeans', 'cargo', 'shorts', 'track', 'jeans'];
+  const tops: TopType[] = f ? ['tee', 'tank', 'jacket', 'hoodie', 'shirt', 'tee', 'suit'] : ['tee', 'jacket', 'hoodie', 'shirt', 'tee', 'vest', 'tank', 'suit'];
+  const hs: HairStyle[] = f ? ['long', 'ponytail', 'bob', 'short', 'long', 'quiff', 'beanie'] : ['short', 'buzz', 'quiff', 'bald', 'short', 'slick', 'cap', 'beanie', 'long'];
+  const bt: BottomType[] = f ? ['jeans', 'skirt', 'track', 'shorts', 'jeans', 'cargo'] : ['jeans', 'cargo', 'shorts', 'track', 'jeans', 'jeans'];
   const tt = pick(tops, rng);
+  const aged = rng() < 0.22;
+  const hairStyle = pick(hs, rng);
+  const hair = aged ? pick([0xb5a58a, 0x9a9a9a, 0xcfcfcf], rng) : rng() < 0.07 ? pick(DYED, rng) : pick(HAIRS, rng);
+  const bodyKind = rng();
+  const extras: NonNullable<Look['extras']> = [];
+  if (rng() < 0.3) extras.push('watch');
+  if (rng() < (f ? 0.2 : 0.14)) extras.push('chain');
+  if (rng() < 0.18) extras.push('belt');
+  if (rng() < 0.05) extras.push('earpiece');
+  const skin = pick(SKINS, rng);
+  const suit = tt === 'suit';
+  const bcol = suit ? pick([0x15161a, 0x2a2f3c, 0x3a3a3e, 0x4a4234], rng) : pick(BOT_COLS, rng);
   return {
-    name: 'Citizen', female: f, skin: pick(SKINS, rng), eye: pick(EYES, rng), hair: pick(HAIRS, rng), hairStyle: pick(hs, rng),
-    brow: 0x1a120c, stubble: !f && rng() < 0.4 ? 0.3 + rng() * 0.4 : 0, beard: !f && rng() < 0.12, lip: f ? 0xb2504c : 0x9a5a4a, makeup: f ? 0.3 + rng() * 0.5 : 0,
-    height: (f ? 0.93 : 1.0) + (rng() - 0.5) * 0.1, build: 0.9 + rng() * 0.25, fat: rng() < 0.25 ? 0.4 + rng() * 0.5 : 0, age: rng() < 0.2 ? 1 : 0,
-    glasses: rng() < 0.12 ? pick(['round', 'wayfarer', 'aviator'] as const, rng) : 'none',
-    top: { type: tt, color: pick(TOP_COLS, rng), color2: pick(TOP_COLS, rng), kind: tt === 'jacket' ? 'leather' : tt === 'hoodie' ? 'knit' : 'cotton', long: tt === 'jacket' || tt === 'hoodie' || (tt === 'shirt' && rng() < 0.5) },
+    name: 'Citizen', female: f, skin, eye: pick(EYES, rng), hair, hairStyle,
+    brow: 0x1a120c, stubble: !f && rng() < 0.42 ? 0.25 + rng() * 0.5 : 0, beard: !f && rng() < 0.14, lip: f ? pick([0xb2504c, 0xa03c48, 0xc4605a, 0x8a3a3a], rng) : 0x9a5a4a, makeup: f ? 0.2 + rng() * 0.7 : 0,
+    // body: slim / average / athletic / heavy
+    height: (f ? 0.93 : 1.0) + (rng() - 0.5) * 0.14 + (bodyKind > 0.85 ? 0.03 : 0),
+    build: bodyKind < 0.25 ? 0.88 + rng() * 0.06 : bodyKind < 0.7 ? 0.95 + rng() * 0.1 : 1.05 + rng() * 0.18,
+    fat: bodyKind > 0.78 ? 0.35 + rng() * 0.6 : rng() < 0.12 ? 0.3 : 0,
+    age: aged ? 1 : 0,
+    // face: every citizen gets their own proportions
+    faceW: 0.93 + rng() * 0.14, noseK: 0.8 + rng() * 0.5, earK: 0.85 + rng() * 0.35, neckK: 0.9 + rng() * 0.25,
+    glasses: rng() < 0.14 ? pick(['round', 'wayfarer', 'aviator'] as const, rng) : 'none',
+    top: { type: tt, color: pick(TOP_COLS, rng), color2: pick(TOP_COLS, rng), kind: suit ? 'suit' : tt === 'jacket' ? 'leather' : tt === 'hoodie' ? 'knit' : 'cotton', long: tt === 'jacket' || tt === 'hoodie' || suit || ((tt === 'shirt') && rng() < 0.5) },
     under: pick(TOP_COLS, rng),
-    bottom: { type: pick(bt, rng), color: pick(BOT_COLS, rng), kind: 'denim' },
-    shoes: { color: pick([0xeeeeee, 0x151515, 0x6a4a2a, 0x2a3a5a, 0xa02020], rng), sole: 0xdddddd },
-    extras: rng() < 0.3 ? ['watch'] : [], capColor: pick(TOP_COLS, rng),
+    bottom: suit ? { type: 'suit', color: bcol, kind: 'suit' } : { type: pick(bt, rng), color: bcol, kind: 'denim' },
+    shoes: { color: pick([0xeeeeee, 0x151515, 0x6a4a2a, 0x2a3a5a, 0xa02020, 0x3a3a3a], rng), sole: 0xdddddd, boot: rng() < 0.12 },
+    extras, capColor: pick(TOP_COLS, rng),
   };
 }
 
@@ -164,11 +184,12 @@ function torsoKeys(look: Look): Key[] {
     { y: 1.51, rx: 0.078, rz: 0.064, w: W([3, 1]) },
   ];
 }
-const NECK: Key[] = [
+const NECK_BASE: Key[] = [
   { y: 1.47, rx: 0.058, rz: 0.06, w: W([3, 1]) },
   { y: 1.55, rx: 0.05, rz: 0.054, cz: 0.006, w: W([3, 0.5], [4, 0.5]) },
   { y: 1.6, rx: 0.052, rz: 0.058, cz: 0.012, w: W([4, 1]) },
 ];
+const neckKeys = (k = 1): Key[] => NECK_BASE.map((n) => ({ ...n, rx: n.rx * k, rz: n.rz * (1 + (k - 1) * 0.7) }));
 const ARM: Key[] = [
   { y: 1.5, rx: 0.036, rz: 0.04, cx: 0.205, w: W([2, 0.5], [5, 0.5]) },
   { y: 1.47, rx: 0.062, rz: 0.062, cx: 0.208, w: W([2, 0.35], [5, 0.65]) },
@@ -196,8 +217,8 @@ const LEG: Key[] = [
 ];
 const HEAD_W: [number, number][] = [[4, 1]];
 const EYE_Y = 1.69;
-const headRings = (inf = 0): Ring[] => {
-  const mk = (y: number, rx: number, rz: number, cz: number): Ring => ({ p: [0, y, cz], rx: rx + inf, rz: rz + inf, bones: HEAD_W });
+const headRings = (inf = 0, fw = 1): Ring[] => {
+  const mk = (y: number, rx: number, rz: number, cz: number): Ring => ({ p: [0, y, cz], rx: rx * fw + inf, rz: rz * (1 + (fw - 1) * 0.35) + inf, bones: HEAD_W });
   return [
     mk(1.582, 0.022, 0.026, 0.078),
     mk(1.592, 0.04, 0.045, 0.07),
@@ -267,7 +288,7 @@ function buildBody(look: Look): BuiltHuman {
     return [0, 0, pec + abs + belly];
   };
   mb.loft('skin', span(torso, 0.86, 1.51, 0.03, 0), { segs: 28, uv: 'cyl', uvScale: [3, 3], displace: (x, y, z) => (f ? bust(x, y, z) : male(x, y, z)) });
-  mb.loft('skin', span(NECK, 1.47, 1.6, 0.03, 0), { segs: 24, uv: 'planar', planar: faceUV });
+  mb.loft('skin', span(neckKeys(look.neckK ?? 1), 1.47, 1.6, 0.03, 0), { segs: 24, uv: 'planar', planar: faceUV });
   for (const s of [1, -1]) {
     const mir = s < 0;
     mb.loft('skin', span(ARM, 1.465, 0.86, 0.03, 0, s, mir), { segs: 16, uv: 'cyl', uvScale: [2, 4], capStart: true });
@@ -322,19 +343,20 @@ function buildBody(look: Look): BuiltHuman {
     dy += 0;
     return [dx, dy, dz];
   };
-  mb.loft('head', densify(headRings(), 2), { segs: 48, uv: 'planar', planar: faceUV, displace: hd });
+  mb.loft('head', densify(headRings(0, look.faceW ?? 1), 2), { segs: 48, uv: 'planar', planar: faceUV, displace: hd });
 
   // nose (union of soft ellipsoids)
   const sph = (r = 1, w = 14, h = 10) => new THREE.SphereGeometry(r, w, h);
   const nz = f ? 0.0 : 0.002;
-  mb.rigid('head', sph(), matT(0, EYE_Y - 0.022, 0.1, -0.35, 0, 0, 0.0068, 0.016, 0.0085), B.head);
-  mb.rigid('head', sph(), matT(0, EYE_Y - 0.032, 0.107 + nz, 0, 0, 0, 0.0085, 0.014, 0.0105), B.head);
-  mb.rigid('head', sph(), matT(0, EYE_Y - 0.0385, 0.111 + nz, 0, 0, 0, 0.0095, 0.0085, 0.0095), B.head);
-  for (const s of [-1, 1]) mb.rigid('head', sph(), matT(s * 0.0105, EYE_Y - 0.0405, 0.103 + nz, 0, 0, s * 0.25, 0.0065, 0.0075, 0.0072), B.head);
+  const nk = look.noseK ?? 1, ek = look.earK ?? 1;
+  mb.rigid('head', sph(), matT(0, EYE_Y - 0.022, 0.1, -0.35, 0, 0, 0.0068 * nk, 0.016 * nk, 0.0085 * nk), B.head);
+  mb.rigid('head', sph(), matT(0, EYE_Y - 0.032, 0.107 + nz, 0, 0, 0, 0.0085 * nk, 0.014 * nk, 0.0105 * nk), B.head);
+  mb.rigid('head', sph(), matT(0, EYE_Y - 0.0385, 0.111 + nz, 0, 0, 0, 0.0095 * nk, 0.0085 * nk, 0.0095 * nk), B.head);
+  for (const s of [-1, 1]) mb.rigid('head', sph(), matT(s * 0.0105, EYE_Y - 0.0405, 0.103 + nz, 0, 0, s * 0.25, 0.0065 * nk, 0.0075 * nk, 0.0072 * nk), B.head);
   // ears
   for (const s of [-1, 1]) {
-    mb.rigid('head', sph(), matT(s * 0.0775, EYE_Y - 0.01, -0.004, 0, s * 0.35, 0, 0.0075, 0.03, 0.019), B.head);
-    mb.rigid('head', sph(), matT(s * 0.0795, EYE_Y + 0.0, -0.0075, 0, s * 0.35, 0, 0.0045, 0.022, 0.012), B.head);
+    mb.rigid('head', sph(), matT(s * 0.0775, EYE_Y - 0.01, -0.004, 0, s * 0.35, 0, 0.0075 * ek, 0.03 * ek, 0.019 * ek), B.head);
+    mb.rigid('head', sph(), matT(s * 0.0795, EYE_Y + 0.0, -0.0075, 0, s * 0.35, 0, 0.0045 * ek, 0.022 * ek, 0.012 * ek), B.head);
   }
   // eyes + lids
   for (const s of [-1, 1]) {
@@ -483,12 +505,12 @@ function buildHair(mb: MeshBuilder, look: Look) {
     y -= side * 0.0;
     return y;
   };
-  const rings = densify(headRings(inflate).filter((r) => r.p[1] > 1.6), 3);
+  const rings = densify(headRings(inflate, look.faceW ?? 1).filter((r) => r.p[1] > 1.6), 3);
   // extra volume on top / quiff
   const vol = (st === 'quiff' ? 0.018 : st === 'slick' ? 0.012 : st === 'short' ? 0.012 : st === 'buzz' ? 0 : 0.018) * (f ? 1.1 : 1);
   if (st === 'cap' || st === 'beanie') {
     rings.length = 0;
-    rings.push(...headRings(0.014).filter((r) => r.p[1] > 1.715));
+    rings.push(...headRings(0.014, look.faceW ?? 1).filter((r) => r.p[1] > 1.715));
   }
   mb.loft('hair', rings, {
     segs: 56, uv: 'cyl', uvScale: [3, 14], bone: B.head,
@@ -776,6 +798,9 @@ export const defaultState = (): HumanState => ({ vf: 0, vs: 0, aim: false, aimPi
 
 type V3a = [number, number, number];
 
+let _lidGeo: THREE.BufferGeometry | null = null;
+const lidGeoShared = () => (_lidGeo ??= new THREE.SphereGeometry(0.0124, 16, 10, 0, Math.PI * 2, 0, Math.PI * 0.62));
+
 export class Human {
   root = new THREE.Group();
   mesh: THREE.SkinnedMesh;
@@ -800,6 +825,14 @@ export class Human {
   private breath = Math.random() * 10;
   private blinkT = 2 + Math.random() * 3;
   private blink = 0;
+  private lids: THREE.Group[] = [];
+  private idleT = 2 + Math.random() * 5;
+  private idleKind = 0;
+  private idleP = 0;
+  private idleDur = 2;
+  private idleDir = 1;
+  private wasAir = false;
+  private landT = 0;
   private talkT = Math.random() * 10;
   dead = false;
   lying = false;
@@ -809,7 +842,7 @@ export class Human {
 
   constructor(look: Look) {
     this.look = look;
-    const key = `${look.name}|${look.skin}|${look.hair}|${look.hairStyle}|${look.top.type}|${look.top.color}|${look.bottom.type}|${look.bottom.color}|${look.shoes.color}|${look.female}|${look.height}|${look.build}|${look.fat}|${look.glasses}|${look.beard}|${look.stubble}|${look.extras?.join(',')}|${look.eye}|${look.capColor}`;
+    const key = `${look.name}|${look.skin}|${look.hair}|${look.hairStyle}|${look.top.type}|${look.top.color}|${look.bottom.type}|${look.bottom.color}|${look.shoes.color}|${look.female}|${look.height}|${look.build}|${look.fat}|${look.glasses}|${look.beard}|${look.stubble}|${look.extras?.join(',')}|${look.eye}|${look.capColor}|${look.faceW}|${look.noseK}|${look.earK}|${look.neckK}|${look.age}|${look.makeup}|${look.lip}|${look.top.color2}|${look.under}`;
     let built = geoCache.get(key);
     if (!built) {
       built = buildBody(look);
@@ -834,6 +867,19 @@ export class Human {
     this.root.add(this.mesh);
     this.mesh.bind(this.skeleton);
     this.height = look.height ?? 1;
+    // blinking eyelids (skin-coloured caps pivoting around each eyeball, parented to the head bone)
+    const lidMat = cached('lid' + look.skin, () => new THREE.MeshStandardMaterial({ color: new THREE.Color(look.skin).multiplyScalar(0.93), roughness: 0.6 }));
+    const lidGeo = lidGeoShared();
+    for (const sd of [-1, 1]) {
+      const piv = new THREE.Group();
+      piv.position.set(sd * 0.032, EYE_Y - REST[B.head][1], 0.0845 - REST[B.head][2]);
+      piv.rotation.x = -1.45;
+      const lid = new THREE.Mesh(lidGeo, lidMat);
+      lid.scale.setScalar(look.eyeK ?? 1);
+      piv.add(lid);
+      this.bones[B.head].add(piv);
+      this.lids.push(piv);
+    }
     this.root.scale.setScalar(this.height);
     // weapon holder
     this.holder.rotation.x = Math.PI / 2;
@@ -908,7 +954,7 @@ export class Human {
     const sp = Math.hypot(st.vf, st.vs);
     const run = clamp((sp - 2.2) / 3.5, 0, 1);
     const moving = clamp(sp / 1.2, 0, 1);
-    let hipsY = 0.97, hipsZ = 0;
+    let hipsY = 0.97, hipsZ = 0, hipsX = 0;
     this.hipsY = hipsY;
 
     // ---- locomotion
@@ -951,6 +997,17 @@ export class Human {
       this.tgt[B.chest][0] += br * 0.012;
       this.tgt[B.spine][2] += Math.sin(this.breath * 0.5) * 0.012 * (1 - moving);
       this.S(B.head, -lean * 0.8 + Math.sin(this.breath * 0.4) * 0.02 * (1 - moving));
+      // pelvis counter-rotation + sway: hips and shoulders twist against each other like a real gait
+      const gaitAmp = amp * fwdW;
+      this.tgt[B.hips][1] = -Math.sin(ph) * 0.09 * gaitAmp;
+      this.tgt[B.hips][2] = Math.sin(ph) * 0.035 * moving * fwdW;
+      this.tgt[B.chest][1] += Math.sin(ph) * 0.15 * gaitAmp;
+      this.tgt[B.chest][2] += -Math.sin(ph) * 0.03 * moving;
+      this.tgt[B.head][1] += -Math.sin(ph) * 0.05 * gaitAmp; // head stays level on the move
+      this.tgt[B.head][2] += Math.sin(ph) * 0.02 * moving;
+      hipsX = Math.sin(ph) * 0.012 * moving;
+      // idle life: glances, weight shifts, watch checks, neck stretches
+      hipsX += this.idleLife(dt, st, moving);
       // arms swing
       if (st.panic) {
         this.S(B.uArmL, -2.3 + Math.sin(this.phase * 2) * 0.3, 0, 0.3);
@@ -972,6 +1029,18 @@ export class Human {
         this.S(B.shinR, 0.5);
         this.S(B.uArmL, -0.6, 0, 0.7);
         this.S(B.uArmR, -0.6, 0, -0.7);
+      }
+      // landing squash: knees absorb the impact
+      if (this.wasAir && !st.air) this.landT = 0.32;
+      this.wasAir = st.air;
+      if (this.landT > 0) {
+        this.landT -= dt;
+        const lk = Math.sin(Math.PI * (1 - Math.max(0, this.landT) / 0.32));
+        hipsY -= 0.12 * lk;
+        this.tgt[B.thighL][0] -= 0.55 * lk; this.tgt[B.thighR][0] -= 0.55 * lk;
+        this.tgt[B.shinL][0] += 0.9 * lk; this.tgt[B.shinR][0] += 0.9 * lk;
+        this.tgt[B.spine][0] += 0.22 * lk;
+        this.tgt[B.uArmL][2] += 0.3 * lk; this.tgt[B.uArmR][2] -= 0.3 * lk;
       }
       // footsteps
       const sn = Math.sin(ph);
@@ -1023,16 +1092,56 @@ export class Human {
       this.bones[i].rotation.set(p[0], p[1], p[2]);
     }
     this.hipsY = damp(this.hipsY, hipsY, 14, dt);
-    this.bones[0].position.set(0, this.hipsY - this.rootDrop, hipsZ);
+    this.bones[0].position.set(hipsX, this.hipsY - this.rootDrop, hipsZ);
     this.root.rotation.x = this.rootPitch;
 
     // blink
     this.blinkT -= dt;
     if (this.blinkT < 0) {
-      this.blink = 0.14;
-      this.blinkT = 2 + Math.random() * 4;
+      this.blink = 0.15;
+      this.blinkT = Math.random() < 0.2 ? 0.28 : 2 + Math.random() * 4.5; // sometimes a double-blink
     }
     if (this.blink > 0) this.blink -= dt;
+    // eyelids actually close: smooth triangle, plus a sleepy half-close when dead
+    const bl = this.dead ? 0.92 : this.blink > 0 ? Math.sin(Math.PI * (1 - Math.max(0, this.blink) / 0.15)) : 0;
+    const lidRot = -1.45 + bl * 1.62 + (st.lookY ?? 0) * 0.15;
+    for (const l of this.lids) l.rotation.x = lidRot;
+  }
+
+  /** random small behaviours while standing still. Returns a lateral hip offset (weight shift). */
+  private idleLife(dt: number, st: HumanState, moving: number): number {
+    const still = moving < 0.15 && !st.aim && st.weapon === 'none' && !st.talk && !st.phone && !st.panic && st.stance === 'stand' && !st.air;
+    // always-on micro motion: slow head drift + shoulder breathing
+    const t = this.breath;
+    this.tgt[B.head][1] += (Math.sin(t * 0.37) * 0.05 + Math.sin(t * 0.91) * 0.025) * (1 - moving);
+    this.tgt[B.head][0] += Math.sin(t * 0.53 + 1) * 0.02 * (1 - moving);
+    this.tgt[B.uArmL][2] += Math.sin(t * 1.8) * 0.01; this.tgt[B.uArmR][2] -= Math.sin(t * 1.8) * 0.01;
+    if (!still) { this.idleKind = 0; this.idleT = Math.max(this.idleT, 1.5); return 0; }
+    this.idleT -= dt;
+    if (this.idleKind === 0 && this.idleT < 0) {
+      this.idleKind = 1 + Math.floor(Math.random() * 5);
+      this.idleP = 0; this.idleDur = 1.3 + Math.random() * 1.6; this.idleDir = Math.random() < 0.5 ? -1 : 1;
+    }
+    if (this.idleKind === 0) return 0;
+    this.idleP += dt;
+    const p = this.idleP / this.idleDur;
+    if (p >= 1) { this.idleKind = 0; this.idleT = 3 + Math.random() * 6; return 0; }
+    const e = Math.sin(Math.PI * p), w = e * e * (3 - 2 * e);
+    const d = this.idleDir;
+    switch (this.idleKind) {
+      case 1: // glance to the side
+        this.tgt[B.head][1] += d * 0.75 * w; this.tgt[B.neck][1] += d * 0.25 * w; this.tgt[B.chest][1] += d * 0.12 * w; break;
+      case 2: // look up at the sky / buildings
+        this.tgt[B.head][0] -= 0.4 * w; this.tgt[B.neck][0] -= 0.15 * w; this.tgt[B.head][1] += d * 0.2 * w; break;
+      case 3: // check the watch
+        this.tgt[B.uArmL][0] += -0.85 * w; this.tgt[B.uArmL][2] -= 0.05 * w; this.tgt[B.fArmL][0] += -1.5 * w; this.tgt[B.head][0] += 0.28 * w; this.tgt[B.spine][0] += 0.05 * w; break;
+      case 4: // neck / shoulder stretch
+        this.tgt[B.head][2] += d * 0.3 * w; this.tgt[B.neck][2] += d * 0.12 * w; this.tgt[B.uArmL][2] += 0.12 * w; this.tgt[B.uArmR][2] -= 0.12 * w; this.tgt[B.chest][0] -= 0.05 * w; break;
+      default: // shift weight onto one leg
+        this.tgt[B.spine][2] += -d * 0.05 * w; this.tgt[B.hips][2] += d * 0.06 * w; this.tgt[B.thighL][2] += d * 0.04 * w; this.tgt[B.thighR][2] += d * 0.04 * w;
+        return d * 0.035 * w;
+    }
+    return 0;
   }
 
   private poseSit(st: HumanState) {

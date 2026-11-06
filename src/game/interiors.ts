@@ -6,6 +6,7 @@ import { buildWeaponModel, WEAPON_ORDER } from './weapons';
 import { mkCanvas, signTex, toTex } from './textures';
 import { mulberry32 } from './util';
 import { hud, emitHud } from './store';
+import { buildRoomProps, updateProps, type Prop } from './micro';
 
 /**
  * Walkable interiors. Each shop / garage / apartment is a real room parked far from the city.
@@ -27,6 +28,12 @@ export interface Room {
   screens: THREE.MeshBasicMaterial[];
   lightPts: [number, number, number][];
   tint: number;
+  props: Prop[];
+  strips: { m: THREE.MeshBasicMaterial; c: THREE.Color }[];
+  lightsOn: boolean;
+  tvOn: boolean;
+  spinPaused: boolean;
+  greetT: number;
 }
 
 const M = {
@@ -105,8 +112,10 @@ class Builder {
   }
   /** a fluorescent ceiling strip + remembers a light position */
   strip(x: number, z: number, len: number, alongX = true) {
-    const m = this.box(x, this.r.H - 0.14, z, alongX ? len : 0.3, 0.1, alongX ? 0.3 : len, M.glow(0xfff4e0, 1.1));
+    const gm = M.glow(0xfff4e0, 1.1);
+    const m = this.box(x, this.r.H - 0.14, z, alongX ? len : 0.3, 0.1, alongX ? 0.3 : len, gm);
     m.position.y = this.r.H - 0.1;
+    this.r.strips.push({ m: gm, c: gm.color.clone() });
   }
 }
 
@@ -365,6 +374,8 @@ export class Interiors {
   busy = false;
   private ret = { x: 0, z: 0, heading: 0 };
   private t = 0;
+  private lightBase = 0;
+  activeProp: Prop | null = null;
 
   constructor(private g: Game) {
     for (let i = 0; i < 4; i++) {
@@ -384,6 +395,7 @@ export class Interiors {
     const r: Room = {
       id, title: g.world.pois.find((p) => p.id === id)?.name ?? id, W: d.W, D: d.D, H: d.H, ox: 7000 + idx * 90, oz: 7000, group, solids: [],
       keeper: null, extras: [], terminal: { x: 0, z: d.D / 2 - 5.6, label: d.terminal }, spinners: [], cars: [], screens: [], lightPts: [], tint: d.light,
+      props: [], strips: [], lightsOn: true, tvOn: true, spinPaused: false, greetT: 0,
     };
     group.position.set(r.ox, 0, r.oz);
     const b = new Builder(r);
@@ -409,6 +421,7 @@ export class Interiors {
     b.sign('EXIT', '#06240f', '#46ff8a', 0, 3.25, -d.D / 2 + 0.2, 1.4, 0.45, 0, 1.4);
     // content
     d.build(b, g);
+    buildRoomProps(r, id, g);
     // fluorescent light positions
     r.lightPts = [[-d.W / 4, d.H - 0.8, -d.D / 4], [d.W / 4, d.H - 0.8, -d.D / 4], [-d.W / 4, d.H - 0.8, d.D / 4], [d.W / 4, d.H - 0.8, d.D / 4]];
     // keeper(s)
@@ -471,7 +484,10 @@ export class Interiors {
         l.color.set(r!.tint);
         l.distance = Math.max(r!.W, r!.D) * 0.95;
         l.intensity = 38 * DEFS[id].lightK * (r!.H / 4.5);
+        this.lightBase = l.intensity;
       });
+      g.audio.chime();
+      r.greetT = 2.4;
       hud.fade = false; hud.shop = null;
       g.toast(r.title, r.terminal.label, 'info');
       emitHud();
@@ -511,13 +527,28 @@ export class Interiors {
     });
   }
 
+  setLights(r: Room, on: boolean) {
+    r.lightsOn = on;
+    this.lights.forEach((l) => (l.intensity = this.lightBase * (on ? 1 : 0.1)));
+    r.strips.forEach((s) => s.m.color.copy(s.c).multiplyScalar(on ? 1 : 0.08));
+  }
+
+  useProp() {
+    const p = this.activeProp, r = this.current;
+    if (!p || !r || this.busy) return;
+    p.use(this.g, r);
+  }
+
   /** what can the player do at (x,z)? */
-  interactAt(x: number, z: number): { kind: 'exit' | 'shop'; prompt: string } | null {
+  interactAt(x: number, z: number): { kind: 'exit' | 'shop' | 'prop'; prompt: string; prop?: Prop } | null {
     const r = this.current;
     if (!r || this.busy) return null;
     const lx = x - r.ox, lz = z - r.oz;
     if (Math.hypot(lx, lz + r.D / 2) < 2.4) return { kind: 'exit', prompt: `Leave ${r.title}` };
     if (Math.hypot(lx - r.terminal.x, lz - r.terminal.z) < 2.6) return { kind: 'shop', prompt: r.terminal.label };
+    let best: Prop | null = null, bd = 1e9;
+    for (const p of r.props) { const d = Math.hypot(lx - p.x, lz - p.z); if (d < p.r && d < bd) { bd = d; best = p; } }
+    if (best) return { kind: 'prop', prompt: best.label, prop: best };
     return null;
   }
 
@@ -561,8 +592,13 @@ export class Interiors {
     const r = this.current;
     if (!r) return;
     const p = this.g.player;
-    for (const s of r.spinners) s.rotation.y += dt * 0.35;
-    r.screens.forEach((m) => m.color.setRGB(0.1 + 0.15 * Math.abs(Math.sin(this.t * 1.7)), 0.3 + 0.2 * Math.abs(Math.sin(this.t * 0.9)), 0.9 + 0.2 * Math.sin(this.t * 2.3)));
+    if (!r.spinPaused) for (const s of r.spinners) s.rotation.y += dt * 0.35;
+    r.greetT = Math.max(0, r.greetT - dt);
+    updateProps(r, this.t, p.x, p.z, dt);
+    r.screens.forEach((m) => {
+      if (!r.tvOn) { m.color.setRGB(0.01, 0.012, 0.015); return; }
+      m.color.setRGB(0.1 + 0.15 * Math.abs(Math.sin(this.t * 1.7)), 0.3 + 0.2 * Math.abs(Math.sin(this.t * 0.9)), 0.9 + 0.2 * Math.sin(this.t * 2.3));
+    });
     const all = r.keeper ? [r.keeper, ...r.extras] : r.extras;
     for (const k of all) {
       const dx = p.x - (r.ox + k.x), dz = p.z - (r.oz + k.z);
@@ -571,7 +607,8 @@ export class Interiors {
       if (d < 6) face = Math.atan2(dx, dz);
       let da = face - k.human.root.rotation.y; da = Math.atan2(Math.sin(da), Math.cos(da));
       k.human.root.rotation.y += da * Math.min(1, dt * 4);
-      k.hs.talk = k === r.keeper && d < 4;
+      k.hs.talk = k === r.keeper && (d < 4 || r.greetT > 0);
+      k.hs.lookX = d < 7 ? Math.max(-0.9, Math.min(0.9, Math.atan2(Math.sin(Math.atan2(dx, dz) - k.human.root.rotation.y), Math.cos(Math.atan2(dx, dz) - k.human.root.rotation.y)))) : 0;
       k.human.update(dt, k.hs);
     }
   }

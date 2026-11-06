@@ -5,3 +5,10 @@ canvas { outline: none; }
 @keyframes floatUp { 0% { transform: translate(-50%, 0) scale(.7); opacity: 0; } 15% { transform: translate(-50%, -10px) scale(1.15); opacity: 1; } 100% { transform: translate(-50%, -64px) scale(1); opacity: 0; } }
 @keyframes pop { 0% { transform: scale(1.5); opacity: 0; } 100% { transform: scale(1); opacity: 1; } }
 @keyframes fadeIn { from { opacity: 0; } to { opacity: 1; } }
+@keyframes promptIn { 0% { transform: translate(-50%, 14px) scale(.8); opacity: 0; } 100% { transform: translate(-50%, 0) scale(1); opacity: 1; } }
+@keyframes keyPulse { 0%, 100% { transform: translateY(0) scale(1); box-shadow: 0 2px 0 rgba(255,255,255,.35); } 50% { transform: translateY(1px) scale(.93); box-shadow: 0 0 0 rgba(255,255,255,0); } }
+/* micro-interaction feel for every button */
+button { transition: transform .12s cubic-bezier(.2,1.4,.4,1), filter .12s, background-color .15s, box-shadow .15s; }
+button:not(:disabled):hover { transform: translateY(-1px) scale(1.025); filter: brightness(1.12); }
+button:not(:disabled):active { transform: translateY(1px) scale(.95); filter: brightness(.92); }
+@keyframes toastIn { 0% { transform: translateX(60px) scale(.92); opacity: 0; } 100% { transform: translateX(0) scale(1); opacity: 1; } }

@@ -214,7 +214,7 @@ export class Sky {
     this.moon.intensity = this.night * 0.55 * (1 - this.rain * 0.5);
     this.moon.position.set(-this.sunDir.x * 200, Math.max(30, -this.sunDir.y * 200), 80);
     const ind = 1 - 0.72 * this.indoor;
-    this.hemi.intensity = (0.28 + dayK * 0.42) * ind + this.lightning * 4;
+    this.hemi.intensity = (0.28 + dayK * 0.42) * ind + this.lightning * 4 * (1 - this.indoor * 0.9);
     this.hemi.color.copy(zen).lerp(new THREE.Color(1, 1, 1), 0.35);
     this.hemi.groundColor.set(0x3a362f).multiplyScalar(0.3 + dayK * 0.8);
     this.fog.color.copy(hor);
@@ -258,7 +258,7 @@ export class Sky {
     this.sun.position.set(fx + this.sunDir.x * 220, this.sunDir.y * 220 + 10, fz + this.sunDir.z * 220);
     this.sun.target.updateMatrixWorld();
     // rain
-    const active = this.rain > 0.04;
+    const active = this.rain > 0.04 && this.indoor < 0.5;
     this.rainLines.visible = active;
     if (active) {
       (this.rainLines.material as THREE.LineBasicMaterial).opacity = 0.1 + this.rain * 0.35;
